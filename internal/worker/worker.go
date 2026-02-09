@@ -184,12 +184,6 @@ func (w *Worker) Run(ctx context.Context) error {
 			consecutiveFailures++
 			w.sleep(ctx, consecutiveFailures)
 		} else {
-			if s == stateReviewsPending {
-				// No review action performed (or nothing left to do); keep monitoring this PR
-				w.logger.Info("no review actions performed, continuing to monitor PR")
-				w.sleep(ctx, 0)
-				continue
-			}
 			// Exit after successful action, let next poll cycle evaluate fresh state
 			w.logger.Info("action completed, exiting worker")
 			return nil
