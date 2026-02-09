@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"time"
 
 	"github.com/marcin-skalski/auto-claude/internal/claude"
 	"github.com/marcin-skalski/auto-claude/internal/config"
@@ -21,12 +20,8 @@ const (
 	stateReviewsPending
 	stateChecksPending
 	stateReady
-)
 
-const (
 	maxRetriesPerAction = 3
-	baseSleep           = 30 * time.Second
-	maxBackoff          = 5 * time.Minute
 )
 
 var (
@@ -38,9 +33,9 @@ var (
 	}
 
 	renovateAuthors = map[string]struct{}{
-		"renovate":       {},
-		"renovate[bot]":  {},
-		"renovate-bot":   {},
+		"renovate":      {},
+		"renovate[bot]": {},
+		"renovate-bot":  {},
 	}
 )
 
@@ -52,8 +47,8 @@ type Worker struct {
 	git    *git.Client
 	logger *slog.Logger
 
-	retries             map[state]int
 	cachedReviewThreads []github.ReviewThread
+	retries             map[state]int
 }
 
 func New(repo config.RepoConfig, pr github.PRInfo, gh *github.Client, cl *claude.Client, g *git.Client, logger *slog.Logger) *Worker {
@@ -68,7 +63,7 @@ func New(repo config.RepoConfig, pr github.PRInfo, gh *github.Client, cl *claude
 	}
 }
 
-// Run is the main worker loop. Blocks until PR is merged, max retries exceeded, or context cancelled.
+// Run evaluates PR once and takes action if needed. Exits after action or if waiting required. Daemon restarts on next poll.
 func (w *Worker) Run(ctx context.Context) error {
 	w.logger.Info("worker started", "title", w.pr.Title, "head", w.pr.HeadRef)
 
@@ -275,22 +270,6 @@ func isRenovateAuthor(author string) bool {
 	return ok
 }
 
-func (w *Worker) sleep(ctx context.Context, failures int) {
-	d := baseSleep
-	if failures > 0 {
-		d = baseSleep * time.Duration(1<<uint(failures))
-		if d > maxBackoff {
-			d = maxBackoff
-		}
-	}
-
-	w.logger.Debug("sleeping", "duration", d)
-	select {
-	case <-ctx.Done():
-	case <-time.After(d):
-	}
-}
-
 func stateString(s state) string {
 	switch s {
 	case stateDraft:
@@ -308,4 +287,9 @@ func stateString(s state) string {
 	default:
 		return "unknown"
 	}
+}
+
+func (w *Worker) sleep(ctx context.Context, consecutiveFailures int) {
+	// No actual sleep, just return - daemon controls polling
+	// This method exists for compatibility with retry logic
 }

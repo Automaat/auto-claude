@@ -14,7 +14,7 @@ func (w *Worker) resolveConflicts(ctx context.Context, wtDir string) error {
 	}
 
 	prompt := fmt.Sprintf(
-		"This branch has conflicts with %s. Run `git merge origin/%s`, resolve all conflicts, then `git add . && git commit -s -S -m 'resolve merge conflicts'`.",
+		"This branch has conflicts with %s. Run `git merge origin/%s`, resolve all conflicts, commit with -s -S flags, and push.",
 		w.repo.BaseBranch, w.repo.BaseBranch,
 	)
 
@@ -59,7 +59,7 @@ func (w *Worker) fixChecks(ctx context.Context, wtDir string) error {
 	}
 
 	prompt := fmt.Sprintf(
-		"CI checks failing: %s. Investigate failures, fix code, commit with -s -S flags. Run relevant tests locally to verify.",
+		"CI checks failing: %s. Investigate failures, fix code, commit with -s -S flags, run tests locally to verify, and push.",
 		strings.Join(failing, ", "),
 	)
 
@@ -154,5 +154,14 @@ func (w *Worker) fixReviews(ctx context.Context, wtDir string) error {
 }
 
 func (w *Worker) merge(ctx context.Context) error {
-	return w.gh.MergePR(ctx, w.repo.Owner, w.repo.Name, w.pr.Number, w.repo.MergeMethod)
+	err := w.gh.MergePR(ctx, w.repo.Owner, w.repo.Name, w.pr.Number, w.repo.MergeMethod)
+	if err != nil && strings.Contains(err.Error(), "Base branch was modified") {
+		w.logger.Info("base branch modified, updating PR branch")
+		if updateErr := w.gh.UpdateBranch(ctx, w.repo.Owner, w.repo.Name, w.pr.Number); updateErr != nil {
+			return fmt.Errorf("update branch: %w", updateErr)
+		}
+		w.logger.Info("PR branch updated, will retry merge on next poll after checks pass")
+		return nil // Exit successfully, next poll will retry merge
+	}
+	return err
 }
