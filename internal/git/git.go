@@ -100,6 +100,21 @@ func (c *Client) Push(ctx context.Context, dir, branch string) error {
 	return c.run(ctx, dir, "git", "push", "origin", branch)
 }
 
+// HasUnpushedCommits checks if there are local commits not on remote.
+func (c *Client) HasUnpushedCommits(ctx context.Context, dir, branch string) (bool, error) {
+	// Count commits ahead of remote
+	cmd := exec.CommandContext(ctx, "git", "rev-list", "--count", "origin/"+branch+".."+branch)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		c.logger.Debug("exec", "cmd", "git rev-list --count origin/"+branch+".."+branch, "dir", dir)
+		return false, fmt.Errorf("git rev-list --count origin/%s..%s: %w\n%s", branch, branch, err, string(out))
+	}
+
+	count := strings.TrimSpace(string(out))
+	return count != "0", nil
+}
+
 func (c *Client) run(ctx context.Context, dir string, name string, args ...string) error {
 	c.logger.Debug("exec", "cmd", name+" "+strings.Join(args, " "), "dir", dir)
 	cmd := exec.CommandContext(ctx, name, args...)

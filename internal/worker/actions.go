@@ -26,6 +26,16 @@ func (w *Worker) resolveConflicts(ctx context.Context, wtDir string) error {
 		return fmt.Errorf("claude failed: %s", result.Output)
 	}
 
+	// Check if Claude actually created commits
+	hasChanges, err := w.git.HasUnpushedCommits(ctx, wtDir, w.pr.HeadRef)
+	if err != nil {
+		return fmt.Errorf("check unpushed commits: %w", err)
+	}
+
+	if !hasChanges {
+		return fmt.Errorf("no commits created by claude, cannot push")
+	}
+
 	if err := w.git.Push(ctx, wtDir, w.pr.HeadRef); err != nil {
 		return fmt.Errorf("push: %w", err)
 	}
@@ -59,6 +69,16 @@ func (w *Worker) fixChecks(ctx context.Context, wtDir string) error {
 	}
 	if !result.Success {
 		return fmt.Errorf("claude failed: %s", result.Output)
+	}
+
+	// Check if Claude actually created commits
+	hasChanges, err := w.git.HasUnpushedCommits(ctx, wtDir, w.pr.HeadRef)
+	if err != nil {
+		return fmt.Errorf("check unpushed commits: %w", err)
+	}
+
+	if !hasChanges {
+		return fmt.Errorf("no commits created by claude, cannot push")
 	}
 
 	if err := w.git.Push(ctx, wtDir, w.pr.HeadRef); err != nil {
@@ -104,6 +124,16 @@ func (w *Worker) fixReviews(ctx context.Context, wtDir string) error {
 	}
 	if !result.Success {
 		return fmt.Errorf("claude failed: %s", result.Output)
+	}
+
+	// Check if Claude actually created commits
+	hasChanges, err := w.git.HasUnpushedCommits(ctx, wtDir, w.pr.HeadRef)
+	if err != nil {
+		return fmt.Errorf("check unpushed commits: %w", err)
+	}
+
+	if !hasChanges {
+		return fmt.Errorf("no commits created by claude, cannot push")
 	}
 
 	if err := w.git.Push(ctx, wtDir, w.pr.HeadRef); err != nil {
