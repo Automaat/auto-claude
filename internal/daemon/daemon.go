@@ -368,20 +368,18 @@ func (d *Daemon) GetSnapshot() tui.Snapshot {
 				repoWorkers++
 			}
 
-			hasCopilotReview := copilotCacheCopy[wk]
-			hasUnresolvedCopilot := copilotUnresolvedCacheCopy[wk]
-			states := inferStatesFromPR(pr, *repo.RequireCopilotReview, hasCopilotReview, hasUnresolvedCopilot)
-
-			// Skip blocked PRs (draft, checks pending/failing, copilot pending)
-			if isBlocked(states) {
+			// Skip PRs with blocked/on-hold labels
+			if hasBlockingLabel(pr) {
 				blockedCount++
 				continue
 			}
 
+			hasCopilotReview := copilotCacheCopy[wk]
+			hasUnresolvedCopilot := copilotUnresolvedCacheCopy[wk]
 			prStates = append(prStates, tui.PRState{
 				Number:    pr.Number,
 				Title:     pr.Title,
-				States:    states,
+				States:    inferStatesFromPR(pr, *repo.RequireCopilotReview, hasCopilotReview, hasUnresolvedCopilot),
 				Author:    pr.Author.Login,
 				HasWorker: hasWorker,
 			})
@@ -404,15 +402,9 @@ func (d *Daemon) GetSnapshot() tui.Snapshot {
 	}
 }
 
-func isBlocked(states []string) bool {
-	blockingStates := map[string]bool{
-		"draft":           true,
-		"checks_pending":  true,
-		"checks_failing":  true,
-		"copilot_pending": true,
-	}
-	for _, s := range states {
-		if blockingStates[s] {
+func hasBlockingLabel(pr github.PRInfo) bool {
+	for _, label := range pr.Labels {
+		if label.Name == "blocked" || label.Name == "on-hold" {
 			return true
 		}
 	}

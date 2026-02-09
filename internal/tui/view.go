@@ -64,13 +64,18 @@ func renderTree(repos []RepoState) string {
 		b.WriteString(treeRepoStyle.Render(repoLine))
 		b.WriteString("\n")
 
-		if len(repo.PRs) == 0 {
+		if len(repo.PRs) == 0 && repo.BlockedPRs == 0 {
 			childPrefix := "│  "
 			if isLast {
 				childPrefix = "   "
 			}
 			b.WriteString(emptyStyle.Render(childPrefix + "  (no open PRs)"))
 			b.WriteString("\n")
+			continue
+		}
+
+		if len(repo.PRs) == 0 && repo.BlockedPRs > 0 {
+			// Don't show anything - the blocked count in the header is enough
 			continue
 		}
 
