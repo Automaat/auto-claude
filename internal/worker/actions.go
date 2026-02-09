@@ -26,19 +26,18 @@ func (w *Worker) resolveConflicts(ctx context.Context, wtDir string) error {
 		return fmt.Errorf("claude failed: %s", result.Output)
 	}
 
-	// Validate that Claude pushed changes
-	if err := w.git.Fetch(ctx, wtDir); err != nil {
-		return fmt.Errorf("fetch after resolution: %w", err)
-	}
-
-	hasUnpushed, err := w.git.HasUnpushedCommits(ctx, wtDir, w.pr.HeadRef)
+	// Check if Claude actually created commits
+	hasChanges, err := w.git.HasUnpushedCommits(ctx, wtDir, w.pr.HeadRef)
 	if err != nil {
 		return fmt.Errorf("check unpushed commits: %w", err)
 	}
 
-	if hasUnpushed {
-		w.logger.Warn("claude completed but did not push changes")
-		return fmt.Errorf("changes not pushed to remote")
+	if !hasChanges {
+		return fmt.Errorf("no commits created by claude, cannot push")
+	}
+
+	if err := w.git.Push(ctx, wtDir, w.pr.HeadRef); err != nil {
+		return fmt.Errorf("push: %w", err)
 	}
 
 	w.logger.Info("conflicts resolved and pushed")
@@ -72,19 +71,18 @@ func (w *Worker) fixChecks(ctx context.Context, wtDir string) error {
 		return fmt.Errorf("claude failed: %s", result.Output)
 	}
 
-	// Validate that Claude pushed changes
-	if err := w.git.Fetch(ctx, wtDir); err != nil {
-		return fmt.Errorf("fetch after fix: %w", err)
-	}
-
-	hasUnpushed, err := w.git.HasUnpushedCommits(ctx, wtDir, w.pr.HeadRef)
+	// Check if Claude actually created commits
+	hasChanges, err := w.git.HasUnpushedCommits(ctx, wtDir, w.pr.HeadRef)
 	if err != nil {
 		return fmt.Errorf("check unpushed commits: %w", err)
 	}
 
-	if hasUnpushed {
-		w.logger.Warn("claude completed but did not push changes")
-		return fmt.Errorf("changes not pushed to remote")
+	if !hasChanges {
+		return fmt.Errorf("no commits created by claude, cannot push")
+	}
+
+	if err := w.git.Push(ctx, wtDir, w.pr.HeadRef); err != nil {
+		return fmt.Errorf("push: %w", err)
 	}
 
 	w.logger.Info("checks fixed and pushed")
@@ -128,24 +126,19 @@ func (w *Worker) fixReviews(ctx context.Context, wtDir string) error {
 		return fmt.Errorf("claude failed: %s", result.Output)
 	}
 
-	// Validate that changes were pushed (if any were made)
-	if err := w.git.Fetch(ctx, wtDir); err != nil {
-		return fmt.Errorf("fetch after fix: %w", err)
-	}
-
-	hasUnpushed, err := w.git.HasUnpushedCommits(ctx, wtDir, w.pr.HeadRef)
+	// Check if Claude actually created commits
+	hasChanges, err := w.git.HasUnpushedCommits(ctx, wtDir, w.pr.HeadRef)
 	if err != nil {
 		return fmt.Errorf("check unpushed commits: %w", err)
 	}
 
-	if hasUnpushed {
-		w.logger.Warn("claude completed but did not push changes")
-		return fmt.Errorf("changes not pushed to remote")
+	if !hasChanges {
+		return fmt.Errorf("no commits created by claude, cannot push")
 	}
 
-	// Check if any commits were actually made
-	// If no commits, skill determined no changes needed - this is OK
-	// Remote is up to date with local, proceed to resolve threads
+	if err := w.git.Push(ctx, wtDir, w.pr.HeadRef); err != nil {
+		return fmt.Errorf("push: %w", err)
+	}
 
 	// Auto-resolve all Copilot review threads after successful fix
 	w.logger.Info("resolving copilot review threads", "count", len(unresolvedThreads))

@@ -20,8 +20,25 @@ const (
 	stateReviewsPending
 	stateChecksPending
 	stateReady
+
+	maxRetriesPerAction = 3
 )
 
+
+var (
+	copilotAuthors = map[string]struct{}{
+		"Copilot":                       {},
+		"copilot":                       {},
+		"github-copilot[bot]":           {},
+		"copilot-pull-request-reviewer": {},
+	}
+
+	renovateAuthors = map[string]struct{}{
+		"renovate":       {},
+		"renovate[bot]":  {},
+		"renovate-bot":   {},
+	}
+)
 
 type Worker struct {
 	repo   config.RepoConfig
@@ -32,16 +49,18 @@ type Worker struct {
 	logger *slog.Logger
 
 	cachedReviewThreads []github.ReviewThread
+	retries             map[state]int
 }
 
 func New(repo config.RepoConfig, pr github.PRInfo, gh *github.Client, cl *claude.Client, g *git.Client, logger *slog.Logger) *Worker {
 	return &Worker{
-		repo:   repo,
-		pr:     pr,
-		gh:     gh,
-		claude: cl,
-		git:    g,
-		logger: logger.With("pr", pr.Number, "repo", repo.Owner+"/"+repo.Name),
+		repo:    repo,
+		pr:      pr,
+		gh:      gh,
+		claude:  cl,
+		git:     g,
+		logger:  logger.With("pr", pr.Number, "repo", repo.Owner+"/"+repo.Name),
+		retries: make(map[state]int),
 	}
 }
 
@@ -64,73 +83,104 @@ func (w *Worker) Run(ctx context.Context) error {
 		}
 	}()
 
-	// Check context before proceeding
-	select {
-	case <-ctx.Done():
-		w.logger.Info("worker cancelled")
-		return ctx.Err()
-	default:
-	}
+	consecutiveFailures := 0
 
-	// Refresh PR state
-	pr, err := w.gh.GetPRDetail(ctx, w.repo.Owner, w.repo.Name, w.pr.Number)
-	if err != nil {
-		return fmt.Errorf("get PR detail: %w", err)
-	}
-	w.pr = *pr
+	for {
+		select {
+		case <-ctx.Done():
+			w.logger.Info("worker cancelled")
+			return ctx.Err()
+		default:
+		}
 
-	// Fetch review threads for Copilot review status (only if required)
-	if *w.repo.RequireCopilotReview {
-		threads, err := w.gh.GetReviewThreads(ctx, w.repo.Owner, w.repo.Name, w.pr.Number)
+		// Refresh PR state
+		pr, err := w.gh.GetPRDetail(ctx, w.repo.Owner, w.repo.Name, w.pr.Number)
 		if err != nil {
-			return fmt.Errorf("get review threads: %w", err)
+			w.logger.Error("failed to get PR detail", "err", err)
+			consecutiveFailures++
+			w.sleep(ctx, consecutiveFailures)
+			continue
 		}
-		w.cachedReviewThreads = threads
+		w.pr = *pr
+
+		// Fetch review threads for Copilot review status (only if required and not Renovate)
+		if *w.repo.RequireCopilotReview && !isRenovateAuthor(w.pr.Author.Login) {
+			threads, err := w.gh.GetReviewThreads(ctx, w.repo.Owner, w.repo.Name, w.pr.Number)
+			if err != nil {
+				w.logger.Error("failed to get review threads", "err", err)
+				consecutiveFailures++
+				w.sleep(ctx, consecutiveFailures)
+				continue
+			}
+			w.cachedReviewThreads = threads
+		}
+
+		s := w.evaluate()
+		w.logger.Info("evaluated state", "state", stateString(s))
+
+		var actionErr error
+		switch s {
+		case stateDraft:
+			w.logger.Info("PR is draft, sleeping")
+			w.sleep(ctx, 0)
+			continue
+
+		case stateConflicting:
+			if w.retries[stateConflicting] >= maxRetriesPerAction {
+				w.logger.Warn("max retries for conflict resolution")
+				return fmt.Errorf("max retries for conflict resolution")
+			}
+			actionErr = w.resolveConflicts(ctx, wtDir)
+			if actionErr != nil {
+				w.retries[stateConflicting]++
+			}
+
+		case stateChecksFailing:
+			if w.retries[stateChecksFailing] >= maxRetriesPerAction {
+				w.logger.Warn("max retries for fixing checks")
+				return fmt.Errorf("max retries for fixing checks")
+			}
+			actionErr = w.fixChecks(ctx, wtDir)
+			if actionErr != nil {
+				w.retries[stateChecksFailing]++
+			}
+
+		case stateReviewsPending:
+			if w.retries[stateReviewsPending] >= maxRetriesPerAction {
+				w.logger.Warn("max retries for fixing reviews")
+				return fmt.Errorf("max retries for fixing reviews")
+			}
+			actionErr = w.fixReviews(ctx, wtDir)
+			if actionErr != nil {
+				w.retries[stateReviewsPending]++
+			}
+
+		case stateChecksPending:
+			w.logger.Info("checks pending, waiting")
+			w.sleep(ctx, 0)
+			continue
+
+		case stateReady:
+			w.logger.Info("PR ready to merge")
+			if err := w.merge(ctx); err != nil {
+				w.logger.Error("merge failed", "err", err)
+				consecutiveFailures++
+				w.sleep(ctx, consecutiveFailures)
+				continue
+			}
+			w.logger.Info("PR merged successfully")
+			return nil
+		}
+
+		if actionErr != nil {
+			w.logger.Error("action failed", "state", stateString(s), "err", actionErr)
+			consecutiveFailures++
+		} else {
+			consecutiveFailures = 0
+		}
+
+		w.sleep(ctx, consecutiveFailures)
 	}
-
-	s := w.evaluate()
-	w.logger.Info("evaluated state", "state", stateString(s))
-
-	switch s {
-	case stateDraft:
-		w.logger.Info("PR is draft, exiting worker")
-		return nil
-
-	case stateConflicting:
-		if err := w.resolveConflicts(ctx, wtDir); err != nil {
-			return fmt.Errorf("resolve conflicts: %w", err)
-		}
-		w.logger.Info("conflicts resolved, exiting worker")
-		return nil
-
-	case stateChecksFailing:
-		if err := w.fixChecks(ctx, wtDir); err != nil {
-			return fmt.Errorf("fix checks: %w", err)
-		}
-		w.logger.Info("checks fix attempted, exiting worker")
-		return nil
-
-	case stateReviewsPending:
-		if err := w.fixReviews(ctx, wtDir); err != nil {
-			return fmt.Errorf("fix reviews: %w", err)
-		}
-		w.logger.Info("reviews fix attempted, exiting worker")
-		return nil
-
-	case stateChecksPending:
-		w.logger.Info("checks pending, exiting worker")
-		return nil
-
-	case stateReady:
-		w.logger.Info("PR ready to merge")
-		if err := w.merge(ctx); err != nil {
-			return fmt.Errorf("merge: %w", err)
-		}
-		w.logger.Info("PR merged successfully")
-		return nil
-	}
-
-	return nil
 }
 
 func (w *Worker) evaluate() state {
@@ -156,9 +206,8 @@ func (w *Worker) evaluate() state {
 		}
 	}
 
-	// Check Copilot review status before merging (if required)
-	// Skip Copilot review for automated dependency bots
-	if *w.repo.RequireCopilotReview && !isAutomatedDependencyBot(w.pr.Author.Login) {
+	// Check Copilot review status before merging (if required and not Renovate)
+	if *w.repo.RequireCopilotReview && !isRenovateAuthor(w.pr.Author.Login) {
 		copilotStatus := w.checkCopilotReviewStatus()
 		switch copilotStatus {
 		case copilotNotReviewed:
@@ -169,8 +218,6 @@ func (w *Worker) evaluate() state {
 		case copilotResolved:
 			// Continue to merge readiness check
 		}
-	} else if *w.repo.RequireCopilotReview && isAutomatedDependencyBot(w.pr.Author.Login) {
-		w.logger.Info("skipping Copilot review requirement for automated dependency bot", "author", w.pr.Author.Login)
 	}
 
 	// If merge state is blocked, could be other review requirements
@@ -215,18 +262,13 @@ func (w *Worker) checkCopilotReviewStatus() copilotReviewStatus {
 }
 
 func isCopilotAuthor(author string) bool {
-	copilotAuthors := []string{
-		"Copilot",
-		"copilot",
-		"github-copilot[bot]",
-		"copilot-pull-request-reviewer",
-	}
-	for _, ca := range copilotAuthors {
-		if author == ca {
-			return true
-		}
-	}
-	return false
+	_, ok := copilotAuthors[author]
+	return ok
+}
+
+func isRenovateAuthor(author string) bool {
+	_, ok := renovateAuthors[author]
+	return ok
 }
 
 func isAutomatedDependencyBot(author string) bool {
@@ -262,4 +304,9 @@ func stateString(s state) string {
 	default:
 		return "unknown"
 	}
+}
+
+func (w *Worker) sleep(ctx context.Context, consecutiveFailures int) {
+	// No actual sleep, just return - daemon controls polling
+	// This method exists for compatibility with retry logic
 }
