@@ -18,6 +18,9 @@ func (w *Worker) resolveConflicts(ctx context.Context, wtDir string) error {
 		w.repo.BaseBranch, w.repo.BaseBranch,
 	)
 
+	w.onClaudeStart("resolving_conflicts")
+	defer w.onClaudeEnd()
+
 	result, err := w.claude.Run(ctx, wtDir, prompt)
 	if err != nil {
 		return fmt.Errorf("claude resolve conflicts: %w", err)
@@ -62,6 +65,9 @@ func (w *Worker) fixChecks(ctx context.Context, wtDir string) error {
 		"CI checks failing: %s. Investigate failures, fix code, commit with -s -S flags, run tests locally to verify, and push.",
 		strings.Join(failing, ", "),
 	)
+
+	w.onClaudeStart("fixing_checks")
+	defer w.onClaudeEnd()
 
 	result, err := w.claude.Run(ctx, wtDir, prompt)
 	if err != nil {
@@ -116,6 +122,9 @@ func (w *Worker) fixReviews(ctx context.Context, wtDir string) error {
 	if err := w.git.Fetch(ctx, wtDir); err != nil {
 		return fmt.Errorf("fetch: %w", err)
 	}
+
+	w.onClaudeStart("fixing_reviews")
+	defer w.onClaudeEnd()
 
 	prURL := fmt.Sprintf("https://github.com/%s/%s/pull/%d", w.repo.Owner, w.repo.Name, w.pr.Number)
 	result, err := w.claude.RunCommand(ctx, wtDir, "fix-review-auto", prURL)
