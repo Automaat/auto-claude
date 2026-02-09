@@ -37,7 +37,8 @@ type Worker struct {
 	git    *git.Client
 	logger *slog.Logger
 
-	retries map[state]int
+	retries             map[state]int
+	cachedReviewThreads []github.ReviewThread
 }
 
 func New(repo config.RepoConfig, pr github.PRInfo, gh *github.Client, cl *claude.Client, g *git.Client, logger *slog.Logger) *Worker {
@@ -90,6 +91,16 @@ func (w *Worker) Run(ctx context.Context) error {
 			continue
 		}
 		w.pr = *pr
+
+		// Fetch review threads for Copilot review status
+		threads, err := w.gh.GetReviewThreads(ctx, w.repo.Owner, w.repo.Name, w.pr.Number)
+		if err != nil {
+			w.logger.Error("failed to get review threads", "err", err)
+			consecutiveFailures++
+			w.sleep(ctx, consecutiveFailures)
+			continue
+		}
+		w.cachedReviewThreads = threads
 
 		s := w.evaluate()
 		w.logger.Info("evaluated state", "state", stateString(s))
@@ -175,10 +186,6 @@ func (w *Worker) evaluate() state {
 		}
 	}
 
-	// Check for unresolved copilot reviews (done async via GetReviewThreads in fixReviews)
-	// We check mergeStateStatus for BLOCKED which may indicate review requirements
-	// but copilot reviews need explicit thread check, handled in action
-
 	// Check for pending checks
 	for _, c := range w.pr.Checks {
 		if c.Conclusion == "" && c.Status != "COMPLETED" {
@@ -186,12 +193,31 @@ func (w *Worker) evaluate() state {
 		}
 	}
 
-	// If merge state is blocked, could be reviews
+	// Check for unresolved Copilot reviews before merging
+	if w.hasUnresolvedCopilotReviews() {
+		return stateReviewsPending
+	}
+
+	// If merge state is blocked, could be other review requirements
 	if w.pr.MergeStateStatus == "BLOCKED" {
 		return stateReviewsPending
 	}
 
 	return stateReady
+}
+
+func (w *Worker) hasUnresolvedCopilotReviews() bool {
+	for _, t := range w.cachedReviewThreads {
+		if t.IsResolved || t.IsOutdated {
+			continue
+		}
+		for _, c := range t.Comments {
+			if c.Author == "copilot" || c.Author == "github-copilot[bot]" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (w *Worker) sleep(ctx context.Context, failures int) {

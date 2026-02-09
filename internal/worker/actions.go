@@ -72,14 +72,9 @@ func (w *Worker) fixChecks(ctx context.Context, wtDir string) error {
 func (w *Worker) fixReviews(ctx context.Context, wtDir string) error {
 	w.logger.Info("fixing review comments")
 
-	threads, err := w.gh.GetReviewThreads(ctx, w.repo.Owner, w.repo.Name, w.pr.Number)
-	if err != nil {
-		return fmt.Errorf("get review threads: %w", err)
-	}
-
-	// Filter unresolved, non-outdated threads from copilot
+	// Use cached review threads
 	var unresolvedCount int
-	for _, t := range threads {
+	for _, t := range w.cachedReviewThreads {
 		if t.IsResolved || t.IsOutdated {
 			continue
 		}
