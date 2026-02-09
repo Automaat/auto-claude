@@ -157,7 +157,8 @@ func (w *Worker) evaluate() state {
 	}
 
 	// Check Copilot review status before merging (if required)
-	if *w.repo.RequireCopilotReview {
+	// Skip Copilot review for automated dependency bots
+	if *w.repo.RequireCopilotReview && !isAutomatedDependencyBot(w.pr.Author.Login) {
 		copilotStatus := w.checkCopilotReviewStatus()
 		switch copilotStatus {
 		case copilotNotReviewed:
@@ -168,6 +169,8 @@ func (w *Worker) evaluate() state {
 		case copilotResolved:
 			// Continue to merge readiness check
 		}
+	} else if *w.repo.RequireCopilotReview && isAutomatedDependencyBot(w.pr.Author.Login) {
+		w.logger.Info("skipping Copilot review requirement for automated dependency bot", "author", w.pr.Author.Login)
 	}
 
 	// If merge state is blocked, could be other review requirements
@@ -220,6 +223,21 @@ func isCopilotAuthor(author string) bool {
 	}
 	for _, ca := range copilotAuthors {
 		if author == ca {
+			return true
+		}
+	}
+	return false
+}
+
+func isAutomatedDependencyBot(author string) bool {
+	bots := []string{
+		"renovate[bot]",
+		"app/renovate",
+		"dependabot[bot]",
+		"dependabot-preview[bot]",
+	}
+	for _, bot := range bots {
+		if author == bot {
 			return true
 		}
 	}
