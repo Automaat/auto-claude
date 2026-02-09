@@ -100,6 +100,29 @@ func (c *Client) Push(ctx context.Context, dir, branch string) error {
 	return c.run(ctx, dir, "git", "push", "origin", branch)
 }
 
+// HasUnpushedCommits checks if there are local commits not on remote.
+func (c *Client) HasUnpushedCommits(ctx context.Context, dir, branch string) (bool, error) {
+	// Get local commit
+	localCmd := exec.CommandContext(ctx, "git", "rev-parse", branch)
+	localCmd.Dir = dir
+	localOut, err := localCmd.Output()
+	if err != nil {
+		return false, fmt.Errorf("get local commit: %w", err)
+	}
+	localCommit := strings.TrimSpace(string(localOut))
+
+	// Get remote commit
+	remoteCmd := exec.CommandContext(ctx, "git", "rev-parse", "origin/"+branch)
+	remoteCmd.Dir = dir
+	remoteOut, err := remoteCmd.Output()
+	if err != nil {
+		return false, fmt.Errorf("get remote commit: %w", err)
+	}
+	remoteCommit := strings.TrimSpace(string(remoteOut))
+
+	return localCommit != remoteCommit, nil
+}
+
 func (c *Client) run(ctx context.Context, dir string, name string, args ...string) error {
 	c.logger.Debug("exec", "cmd", name+" "+strings.Join(args, " "), "dir", dir)
 	cmd := exec.CommandContext(ctx, name, args...)
