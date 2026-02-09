@@ -193,9 +193,16 @@ func (w *Worker) evaluate() state {
 		}
 	}
 
-	// Check for unresolved Copilot reviews before merging
-	if w.hasUnresolvedCopilotReviews() {
+	// Check Copilot review status before merging
+	copilotStatus := w.checkCopilotReviewStatus()
+	switch copilotStatus {
+	case copilotNotReviewed:
+		w.logger.Info("waiting for Copilot review to complete")
+		return stateChecksPending
+	case copilotUnresolved:
 		return stateReviewsPending
+	case copilotResolved:
+		// Continue to merge readiness check
 	}
 
 	// If merge state is blocked, could be other review requirements
@@ -206,18 +213,37 @@ func (w *Worker) evaluate() state {
 	return stateReady
 }
 
-func (w *Worker) hasUnresolvedCopilotReviews() bool {
+type copilotReviewStatus int
+
+const (
+	copilotNotReviewed copilotReviewStatus = iota
+	copilotUnresolved
+	copilotResolved
+)
+
+func (w *Worker) checkCopilotReviewStatus() copilotReviewStatus {
+	var hasCopilotComment bool
+	var hasUnresolvedComment bool
+
 	for _, t := range w.cachedReviewThreads {
-		if t.IsResolved || t.IsOutdated {
-			continue
-		}
 		for _, c := range t.Comments {
 			if c.Author == "copilot" || c.Author == "github-copilot[bot]" {
-				return true
+				hasCopilotComment = true
+				if !t.IsResolved && !t.IsOutdated {
+					hasUnresolvedComment = true
+				}
+				break
 			}
 		}
 	}
-	return false
+
+	if !hasCopilotComment {
+		return copilotNotReviewed
+	}
+	if hasUnresolvedComment {
+		return copilotUnresolved
+	}
+	return copilotResolved
 }
 
 func (w *Worker) sleep(ctx context.Context, failures int) {
