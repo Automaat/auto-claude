@@ -29,6 +29,21 @@ const (
 	maxBackoff          = 5 * time.Minute
 )
 
+var (
+	copilotAuthors = map[string]struct{}{
+		"Copilot":                       {},
+		"copilot":                       {},
+		"github-copilot[bot]":           {},
+		"copilot-pull-request-reviewer": {},
+	}
+
+	renovateAuthors = map[string]struct{}{
+		"renovate":       {},
+		"renovate[bot]":  {},
+		"renovate-bot":   {},
+	}
+)
+
 type Worker struct {
 	repo   config.RepoConfig
 	pr     github.PRInfo
@@ -251,32 +266,13 @@ func (w *Worker) checkCopilotReviewStatus() copilotReviewStatus {
 }
 
 func isCopilotAuthor(author string) bool {
-	copilotAuthors := []string{
-		"Copilot",
-		"copilot",
-		"github-copilot[bot]",
-		"copilot-pull-request-reviewer",
-	}
-	for _, ca := range copilotAuthors {
-		if author == ca {
-			return true
-		}
-	}
-	return false
+	_, ok := copilotAuthors[author]
+	return ok
 }
 
 func isRenovateAuthor(author string) bool {
-	renovateAuthors := []string{
-		"renovate",
-		"renovate[bot]",
-		"renovate-bot",
-	}
-	for _, ra := range renovateAuthors {
-		if author == ra {
-			return true
-		}
-	}
-	return false
+	_, ok := renovateAuthors[author]
+	return ok
 }
 
 func (w *Worker) sleep(ctx context.Context, failures int) {
