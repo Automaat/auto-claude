@@ -66,7 +66,9 @@ func (w *Worker) Run(ctx context.Context) error {
 		return fmt.Errorf("add worktree: %w", err)
 	}
 	defer func() {
-		w.git.RemoveWorktree(context.Background(), w.repo.Owner, w.repo.Name, w.pr.Number)
+		if err := w.git.RemoveWorktree(context.Background(), w.repo.Owner, w.repo.Name, w.pr.Number); err != nil {
+			w.logger.Error("failed to remove worktree", "error", err)
+		}
 	}()
 
 	consecutiveFailures := 0
