@@ -94,6 +94,9 @@ func (c *Config) setDefaults() error {
 	if err != nil {
 		return fmt.Errorf("parse tui.refresh_interval %q: %w", c.TUI.RawInterval, err)
 	}
+	if tuiInterval <= 0 {
+		return fmt.Errorf("tui.refresh_interval must be positive, got %s", c.TUI.RawInterval)
+	}
 	c.TUI.RefreshInterval = tuiInterval
 
 	for i := range c.Repos {

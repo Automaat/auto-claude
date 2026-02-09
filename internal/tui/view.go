@@ -54,7 +54,7 @@ func renderTree(repos []RepoState) string {
 			prefix = "└─"
 		}
 
-		repoLine := fmt.Sprintf("%s 🔧 %s/%s [%d/%d workers]",
+		repoLine := fmt.Sprintf("%s 🔧 %s/%s [%d workers │ %d PRs]",
 			prefix, repo.Owner, repo.Name, repo.Workers, len(repo.PRs))
 		b.WriteString(treeRepoStyle.Render(repoLine))
 		b.WriteString("\n")
@@ -82,8 +82,8 @@ func renderTree(repos []RepoState) string {
 			}
 
 			title := pr.Title
-			if len(title) > 60 {
-				title = title[:57] + "..."
+			if lipgloss.Width(title) > 60 {
+				title = lipgloss.Truncate(title, 57) + "..."
 			}
 
 			// PR title line

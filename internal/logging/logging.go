@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/lmittmann/tint"
@@ -26,11 +27,14 @@ func SetupLogger(logFile, level string, isTUI bool) (*slog.Logger, error) {
 	}
 
 	// Always write to file with rotation
-	if err := os.MkdirAll(logFile[:len(logFile)-len("/auto-claude.log")], 0755); err != nil {
-		return nil, fmt.Errorf("create log dir: %w", err)
+	logDir := filepath.Dir(logFile)
+	if logDir != "" && logDir != "." {
+		if err := os.MkdirAll(logDir, 0755); err != nil {
+			return nil, fmt.Errorf("create log dir: %w", err)
+		}
 	}
 
-	fileWriter := &lumberjack.Logger{
+	fileWriter = &lumberjack.Logger{
 		Filename:   logFile,
 		MaxSize:    100, // MB
 		MaxBackups: 5,
@@ -101,9 +105,12 @@ func (m *MultiHandler) WithGroup(name string) slog.Handler {
 	return &MultiHandler{handlers: newHandlers}
 }
 
+var fileWriter *lumberjack.Logger
+
 // CloseFile closes the log file writer if it's a lumberjack logger
 func CloseFile(logger *slog.Logger) error {
-	// Try to extract the file writer from handler
-	// This is a best-effort cleanup
+	if fileWriter != nil {
+		return fileWriter.Close()
+	}
 	return nil
 }
