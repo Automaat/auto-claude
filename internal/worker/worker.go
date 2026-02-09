@@ -179,11 +179,12 @@ func (w *Worker) Run(ctx context.Context) error {
 		if actionErr != nil {
 			w.logger.Error("action failed", "state", stateString(s), "err", actionErr)
 			consecutiveFailures++
+			w.sleep(ctx, consecutiveFailures)
 		} else {
-			consecutiveFailures = 0
+			// Exit after successful action, let next poll cycle evaluate fresh state
+			w.logger.Info("action completed, exiting worker")
+			return nil
 		}
-
-		w.sleep(ctx, consecutiveFailures)
 	}
 }
 
