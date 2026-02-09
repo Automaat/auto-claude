@@ -33,7 +33,7 @@ func (c *Client) WorktreeDir(owner, repo string, prNumber int) string {
 func (c *Client) EnsureClone(ctx context.Context, owner, repo string) error {
 	dir := c.CloneDir(owner, repo)
 
-	if _, err := os.Stat(filepath.Join(dir, "HEAD")); err == nil {
+	if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
 		c.logger.Debug("fetching existing clone", "dir", dir)
 		return c.run(ctx, dir, "git", "fetch", "--all", "--prune")
 	}
@@ -44,7 +44,7 @@ func (c *Client) EnsureClone(ctx context.Context, owner, repo string) error {
 
 	url := fmt.Sprintf("https://github.com/%s/%s.git", owner, repo)
 	c.logger.Info("cloning repo", "url", url, "dir", dir)
-	return c.run(ctx, "", "git", "clone", "--bare", url, dir)
+	return c.run(ctx, "", "git", "clone", url, dir)
 }
 
 // AddWorktree creates a worktree for the given branch.
