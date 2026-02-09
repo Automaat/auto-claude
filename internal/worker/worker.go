@@ -196,14 +196,6 @@ func (w *Worker) evaluate() state {
 		return stateDraft
 	}
 
-	// Skip PRs with blocked or on-hold labels
-	for _, label := range w.pr.Labels {
-		if label.Name == "blocked" || label.Name == "on-hold" {
-			w.logger.Debug("PR has blocking label", "label", label.Name)
-			return stateDraft
-		}
-	}
-
 	if w.pr.Mergeable == "CONFLICTING" {
 		return stateConflicting
 	}
