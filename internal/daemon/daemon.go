@@ -36,22 +36,24 @@ type Daemon struct {
 	sessionsMu     sync.Mutex
 	claudeSessions map[string]*claudeSession
 
-	prCacheMu          sync.Mutex
-	prCache            map[string][]github.PRInfo // key: owner/repo
-	copilotReviewCache map[string]bool            // key: owner/repo#number, value: has completed Copilot review
+	prCacheMu              sync.Mutex
+	prCache                map[string][]github.PRInfo // key: owner/repo
+	copilotReviewCache     map[string]bool            // key: owner/repo#number, value: has Copilot reviewed
+	copilotUnresolvedCache map[string]bool            // key: owner/repo#number, value: has unresolved Copilot threads
 }
 
 func New(cfg *config.Config, gh *github.Client, cl *claude.Client, g *git.Client, logger *slog.Logger) *Daemon {
 	return &Daemon{
-		cfg:                cfg,
-		gh:                 gh,
-		claude:             cl,
-		git:                g,
-		logger:             logger,
-		workers:            make(map[string]context.CancelFunc),
-		claudeSessions:     make(map[string]*claudeSession),
-		prCache:            make(map[string][]github.PRInfo),
-		copilotReviewCache: make(map[string]bool),
+		cfg:                    cfg,
+		gh:                     gh,
+		claude:                 cl,
+		git:                    g,
+		logger:                 logger,
+		workers:                make(map[string]context.CancelFunc),
+		claudeSessions:         make(map[string]*claudeSession),
+		prCache:                make(map[string][]github.PRInfo),
+		copilotReviewCache:     make(map[string]bool),
+		copilotUnresolvedCache: make(map[string]bool),
 	}
 }
 
@@ -109,25 +111,27 @@ func (d *Daemon) pollRepo(ctx context.Context, repo config.RepoConfig) error {
 
 			// Fetch review threads to check Copilot status
 			hasCopilotReview := false
+			hasUnresolvedCopilot := false
 			threads, err := d.gh.GetReviewThreads(ctx, repo.Owner, repo.Name, pr.Number)
 			if err == nil {
-				// Check if Copilot has commented
-				hasCopilotComment := false
+				// Check if Copilot has commented and if threads are unresolved
 				for _, t := range threads {
+					hasCopilotInThread := false
 					for _, c := range t.Comments {
 						if isCopilotAuthor(c.Author) {
-							hasCopilotComment = true
+							hasCopilotInThread = true
+							hasCopilotReview = true
 							break
 						}
 					}
-					if hasCopilotComment {
-						break
+					if hasCopilotInThread && !t.IsResolved && !t.IsOutdated {
+						hasUnresolvedCopilot = true
 					}
 				}
-				hasCopilotReview = hasCopilotComment
 			}
 
 			d.copilotReviewCache[prKey] = hasCopilotReview
+			d.copilotUnresolvedCache[prKey] = hasUnresolvedCopilot
 		}
 	}
 	d.prCacheMu.Unlock()
@@ -328,6 +332,10 @@ func (d *Daemon) GetSnapshot() tui.Snapshot {
 	for k, v := range d.copilotReviewCache {
 		copilotCacheCopy[k] = v
 	}
+	copilotUnresolvedCacheCopy := make(map[string]bool, len(d.copilotUnresolvedCache))
+	for k, v := range d.copilotUnresolvedCache {
+		copilotUnresolvedCacheCopy[k] = v
+	}
 	d.prCacheMu.Unlock()
 
 	repos := make([]tui.RepoState, 0, len(d.cfg.Repos))
@@ -348,10 +356,11 @@ func (d *Daemon) GetSnapshot() tui.Snapshot {
 			}
 
 			hasCopilotReview := copilotCacheCopy[key]
+			hasUnresolvedCopilot := copilotUnresolvedCacheCopy[key]
 			prStates = append(prStates, tui.PRState{
 				Number:    pr.Number,
 				Title:     pr.Title,
-				States:    inferStatesFromPR(pr, *repo.RequireCopilotReview, hasCopilotReview),
+				States:    inferStatesFromPR(pr, *repo.RequireCopilotReview, hasCopilotReview, hasUnresolvedCopilot),
 				Author:    pr.Author.Login,
 				HasWorker: hasWorker,
 			})
@@ -383,7 +392,7 @@ func isCopilotAuthor(author string) bool {
 	return copilotAuthors[author]
 }
 
-func inferStatesFromPR(pr github.PRInfo, requireCopilot bool, hasCopilotReview bool) []string {
+func inferStatesFromPR(pr github.PRInfo, requireCopilot bool, hasCopilotReview bool, hasUnresolvedCopilot bool) []string {
 	var states []string
 
 	if pr.IsDraft {
@@ -412,9 +421,13 @@ func inferStatesFromPR(pr github.PRInfo, requireCopilot bool, hasCopilotReview b
 		states = append(states, "checks_pending")
 	}
 
-	// Check for Copilot review if required
-	if requireCopilot && !hasCopilotReview {
-		states = append(states, "copilot_pending")
+	// Check for Copilot review status if required
+	if requireCopilot {
+		if !hasCopilotReview {
+			states = append(states, "copilot_pending")
+		} else if hasUnresolvedCopilot {
+			states = append(states, "fixing_reviews")
+		}
 	}
 
 	if pr.MergeStateStatus == "BLOCKED" {
