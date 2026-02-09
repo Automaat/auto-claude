@@ -43,12 +43,12 @@ type Worker struct {
 
 func New(repo config.RepoConfig, pr github.PRInfo, gh *github.Client, cl *claude.Client, g *git.Client, logger *slog.Logger) *Worker {
 	return &Worker{
-		repo:   repo,
-		pr:     pr,
-		gh:     gh,
-		claude: cl,
-		git:    g,
-		logger: logger.With("pr", pr.Number, "repo", repo.Owner+"/"+repo.Name),
+		repo:    repo,
+		pr:      pr,
+		gh:      gh,
+		claude:  cl,
+		git:     g,
+		logger:  logger.With("pr", pr.Number, "repo", repo.Owner+"/"+repo.Name),
 		retries: make(map[state]int),
 	}
 }
@@ -92,8 +92,8 @@ func (w *Worker) Run(ctx context.Context) error {
 		}
 		w.pr = *pr
 
-		// Fetch review threads for Copilot review status (only if required)
-		if *w.repo.RequireCopilotReview {
+		// Fetch review threads for Copilot review status (only if required and not Renovate)
+		if *w.repo.RequireCopilotReview && !isRenovateAuthor(w.pr.Author.Login) {
 			threads, err := w.gh.GetReviewThreads(ctx, w.repo.Owner, w.repo.Name, w.pr.Number)
 			if err != nil {
 				w.logger.Error("failed to get review threads", "err", err)
@@ -195,8 +195,8 @@ func (w *Worker) evaluate() state {
 		}
 	}
 
-	// Check Copilot review status before merging (if required)
-	if *w.repo.RequireCopilotReview {
+	// Check Copilot review status before merging (if required and not Renovate)
+	if *w.repo.RequireCopilotReview && !isRenovateAuthor(w.pr.Author.Login) {
 		copilotStatus := w.checkCopilotReviewStatus()
 		switch copilotStatus {
 		case copilotNotReviewed:
@@ -259,6 +259,20 @@ func isCopilotAuthor(author string) bool {
 	}
 	for _, ca := range copilotAuthors {
 		if author == ca {
+			return true
+		}
+	}
+	return false
+}
+
+func isRenovateAuthor(author string) bool {
+	renovateAuthors := []string{
+		"renovate",
+		"renovate[bot]",
+		"renovate-bot",
+	}
+	for _, ra := range renovateAuthors {
+		if author == ra {
 			return true
 		}
 	}
