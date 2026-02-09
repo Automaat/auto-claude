@@ -411,13 +411,14 @@ func hasBlockingLabel(pr github.PRInfo) bool {
 	return false
 }
 
+var copilotAuthors = map[string]bool{
+	"Copilot":                       true,
+	"copilot":                       true,
+	"github-copilot[bot]":           true,
+	"copilot-pull-request-reviewer": true,
+}
+
 func isCopilotAuthor(author string) bool {
-	copilotAuthors := map[string]bool{
-		"Copilot":                       true,
-		"copilot":                       true,
-		"github-copilot[bot]":           true,
-		"copilot-pull-request-reviewer": true,
-	}
 	return copilotAuthors[author]
 }
 
