@@ -24,7 +24,6 @@ const (
 	maxRetriesPerAction = 3
 )
 
-
 var (
 	copilotAuthors = map[string]struct{}{
 		"Copilot":                       {},
@@ -34,9 +33,9 @@ var (
 	}
 
 	renovateAuthors = map[string]struct{}{
-		"renovate":       {},
-		"renovate[bot]":  {},
-		"renovate-bot":   {},
+		"renovate":      {},
+		"renovate[bot]": {},
+		"renovate-bot":  {},
 	}
 )
 
@@ -270,22 +269,6 @@ func isRenovateAuthor(author string) bool {
 	_, ok := renovateAuthors[author]
 	return ok
 }
-
-func isAutomatedDependencyBot(author string) bool {
-	bots := []string{
-		"renovate[bot]",
-		"app/renovate",
-		"dependabot[bot]",
-		"dependabot-preview[bot]",
-	}
-	for _, bot := range bots {
-		if author == bot {
-			return true
-		}
-	}
-	return false
-}
-
 
 func stateString(s state) string {
 	switch s {
