@@ -131,7 +131,24 @@ func (w *Worker) fixReviews(ctx context.Context, wtDir string) error {
 		return nil
 	}
 
-	w.logger.Info("found unresolved copilot reviews", "count", len(unresolvedThreads))
+	// Log details about unresolved threads for debugging
+	var threadDetails []string
+	for _, t := range w.cachedReviewThreads {
+		if t.IsResolved || t.IsOutdated {
+			continue
+		}
+		for _, c := range t.Comments {
+			if isCopilotAuthor(c.Author) {
+				commentPreview := c.Body
+				if len(commentPreview) > 100 {
+					commentPreview = commentPreview[:100] + "..."
+				}
+				threadDetails = append(threadDetails, fmt.Sprintf("%s:%d", t.Path, t.Line))
+				break
+			}
+		}
+	}
+	w.logger.Info("found unresolved copilot reviews", "count", len(unresolvedThreads), "threads", threadDetails)
 
 	if err := w.git.Fetch(ctx, wtDir); err != nil {
 		return fmt.Errorf("fetch: %w", err)
@@ -163,7 +180,20 @@ func (w *Worker) fixReviews(ctx context.Context, wtDir string) error {
 	}
 
 	if !hasChanges {
-		return fmt.Errorf("no commits created by claude, cannot push")
+		// Claude completed successfully but made no commits
+		// This means review comments were already addressed or not actionable
+		w.logger.Info("claude determined no changes needed for review comments")
+
+		// Still try to resolve threads since Claude reviewed them
+		w.logger.Info("resolving copilot review threads", "count", len(unresolvedThreads))
+		for _, threadID := range unresolvedThreads {
+			if err := w.gh.ResolveReviewThread(ctx, threadID); err != nil {
+				w.logger.Error("failed to resolve thread", "thread_id", threadID, "err", err)
+			}
+		}
+
+		w.logger.Info("reviews processed, no changes required")
+		return nil
 	}
 
 	if err := w.git.Push(ctx, wtDir, w.pr.HeadRef); err != nil {

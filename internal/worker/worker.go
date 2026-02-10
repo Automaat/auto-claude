@@ -128,9 +128,8 @@ func (w *Worker) Run(ctx context.Context) error {
 		var actionErr error
 		switch s {
 		case stateDraft:
-			w.logger.Info("PR is draft, sleeping")
-			w.sleep(ctx, 0)
-			continue
+			w.logger.Info("PR is draft, waiting for next poll")
+			return nil
 
 		case stateConflicting:
 			if w.retries[stateConflicting] >= maxRetriesPerAction {
@@ -163,9 +162,8 @@ func (w *Worker) Run(ctx context.Context) error {
 			}
 
 		case stateChecksPending:
-			w.logger.Info("checks pending, waiting")
-			w.sleep(ctx, 0)
-			continue
+			w.logger.Info("checks pending, waiting for next poll")
+			return nil
 
 		case stateReady:
 			w.logger.Info("PR ready to merge")
@@ -180,14 +178,12 @@ func (w *Worker) Run(ctx context.Context) error {
 		}
 
 		if actionErr != nil {
-			w.logger.Error("action failed", "state", stateString(s), "err", actionErr)
-			consecutiveFailures++
-			w.sleep(ctx, consecutiveFailures)
-		} else {
-			// Exit after successful action, let next poll cycle evaluate fresh state
-			w.logger.Info("action completed, exiting worker")
+			w.logger.Error("action failed, will retry on next poll", "state", stateString(s), "err", actionErr)
 			return nil
 		}
+		// Exit after successful action, let next poll cycle evaluate fresh state
+		w.logger.Info("action completed, exiting worker")
+		return nil
 	}
 }
 
