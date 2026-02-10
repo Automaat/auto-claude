@@ -46,6 +46,7 @@ type Worker struct {
 	git    *git.Client
 	logger *slog.Logger
 
+	cachedReviews       []github.Review
 	cachedReviewThreads []github.ReviewThread
 
 	onClaudeStart func(action string)
@@ -104,16 +105,38 @@ func (w *Worker) Run(ctx context.Context) error {
 		}
 		w.pr = *pr
 
-		// Fetch review threads for Copilot review status (only if required and not Renovate)
+		// Fetch reviews and review threads for Copilot review status (only if required and not Renovate)
 		if *w.repo.RequireCopilotReview && !isRenovateAuthor(w.pr.Author.Login) {
-			threads, err := w.gh.GetReviewThreads(ctx, w.repo.Owner, w.repo.Name, w.pr.Number)
+			reviews, err := w.gh.GetReviews(ctx, w.repo.Owner, w.repo.Name, w.pr.Number)
 			if err != nil {
-				w.logger.Error("failed to get review threads", "err", err)
+				w.logger.Error("failed to get reviews", "err", err)
 				consecutiveFailures++
 				w.sleep(ctx, consecutiveFailures)
 				continue
 			}
-			w.cachedReviewThreads = threads
+			w.cachedReviews = reviews
+
+			// Only fetch review threads if Copilot review exists (ignore PENDING/DISMISSED)
+			hasCopilotReview := false
+			for _, r := range reviews {
+				if isCopilotAuthor(r.Author) && r.State != "PENDING" && r.State != "DISMISSED" {
+					hasCopilotReview = true
+					break
+				}
+			}
+
+			if hasCopilotReview {
+				threads, err := w.gh.GetReviewThreads(ctx, w.repo.Owner, w.repo.Name, w.pr.Number)
+				if err != nil {
+					w.logger.Error("failed to get review threads", "err", err)
+					consecutiveFailures++
+					w.sleep(ctx, consecutiveFailures)
+					continue
+				}
+				w.cachedReviewThreads = threads
+			} else {
+				w.cachedReviewThreads = nil
+			}
 		}
 
 		// Reset counter after successful PR and thread fetch
@@ -217,13 +240,22 @@ const (
 )
 
 func (w *Worker) checkCopilotReviewStatus() copilotReviewStatus {
-	var hasCopilotComment bool
+	var hasCopilotReview bool
 	var hasUnresolvedComment bool
 
+	// Check top-level reviews
+	for _, r := range w.cachedReviews {
+		if isCopilotAuthor(r.Author) {
+			hasCopilotReview = true
+			break
+		}
+	}
+
+	// Check review threads (inline comments)
 	for _, t := range w.cachedReviewThreads {
 		for _, c := range t.Comments {
 			if isCopilotAuthor(c.Author) {
-				hasCopilotComment = true
+				hasCopilotReview = true
 				if !t.IsResolved && !t.IsOutdated {
 					hasUnresolvedComment = true
 				}
@@ -232,7 +264,7 @@ func (w *Worker) checkCopilotReviewStatus() copilotReviewStatus {
 		}
 	}
 
-	if !hasCopilotComment {
+	if !hasCopilotReview {
 		return copilotNotReviewed
 	}
 	if hasUnresolvedComment {
