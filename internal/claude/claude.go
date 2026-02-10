@@ -45,6 +45,23 @@ type jsonResponse struct {
 	NumTurns     int     `json:"num_turns"`
 }
 
+// streamEvent represents a single event in stream-json output
+type streamEvent struct {
+	Type  string                 `json:"type"`
+	Event map[string]interface{} `json:"event,omitempty"`
+}
+
+// resultEvent represents the final result in stream-json output
+type resultEvent struct {
+	Type         string  `json:"type"`
+	Result       string  `json:"result"`
+	IsError      bool    `json:"is_error"`
+	DurationMs   int     `json:"duration_ms"`
+	TotalCostUSD float64 `json:"total_cost_usd"`
+	SessionID    string  `json:"session_id"`
+	NumTurns     int     `json:"num_turns"`
+}
+
 // Run spawns Claude Code CLI non-interactively.
 func (c *Client) Run(ctx context.Context, workdir, prompt string) (*Result, error) {
 	return c.RunWithCallback(ctx, workdir, prompt, nil)
@@ -52,12 +69,27 @@ func (c *Client) Run(ctx context.Context, workdir, prompt string) (*Result, erro
 
 // RunWithCallback spawns Claude with live output streaming via callback
 func (c *Client) RunWithCallback(ctx context.Context, workdir, prompt string, callback OutputCallback) (*Result, error) {
-	args := []string{
-		"-p", prompt,
-		"--output-format", "json",
-		"--no-session-persistence",
-		"--dangerously-skip-permissions",
-		"--model", c.model,
+	var args []string
+	if callback != nil {
+		// Use stream-json for real-time streaming
+		args = []string{
+			"-p", prompt,
+			"--output-format", "stream-json",
+			"--verbose",
+			"--include-partial-messages",
+			"--no-session-persistence",
+			"--dangerously-skip-permissions",
+			"--model", c.model,
+		}
+	} else {
+		// Use regular json when no streaming needed
+		args = []string{
+			"-p", prompt,
+			"--output-format", "json",
+			"--no-session-persistence",
+			"--dangerously-skip-permissions",
+			"--model", c.model,
+		}
 	}
 
 	c.logger.Info("spawning claude", "workdir", workdir, "prompt_len", len(prompt))
@@ -97,25 +129,47 @@ func (c *Client) RunWithCallback(ctx context.Context, workdir, prompt string, ca
 	done := make(chan struct{}, 2)
 	scanErrs := make(chan error, 2)
 
-	// Stream stdout
+	// Stream stdout (parse stream-json events)
 	go func() {
 		scanner := bufio.NewScanner(stdout)
 		scanner.Buffer(make([]byte, 64*1024), 1024*1024) // 1MB max token
+		var lineBuf strings.Builder // Buffer for partial deltas
 		for scanner.Scan() {
 			line := scanner.Text()
 			outputMu.Lock()
 			outputBuf.WriteString(line)
 			outputBuf.WriteString("\n")
 			outputMu.Unlock()
+
+			// Parse stream-json event and extract text for callback
 			if callback != nil {
-				callback(line)
+				text := extractTextFromStreamEvent(line)
+				if text != "" {
+					lineBuf.WriteString(text)
+					// Split on newlines and send complete lines
+					content := lineBuf.String()
+					if idx := strings.LastIndex(content, "\n"); idx >= 0 {
+						lines := strings.Split(content[:idx+1], "\n")
+						for _, l := range lines {
+							if l != "" {
+								callback(l)
+							}
+						}
+						lineBuf.Reset()
+						lineBuf.WriteString(content[idx+1:])
+					}
+				}
 			}
+		}
+		// Flush remaining partial line if any
+		if callback != nil && lineBuf.Len() > 0 {
+			callback(lineBuf.String())
 		}
 		scanErrs <- scanner.Err()
 		done <- struct{}{}
 	}()
 
-	// Stream stderr
+	// Stream stderr (raw lines)
 	go func() {
 		scanner := bufio.NewScanner(stderr)
 		scanner.Buffer(make([]byte, 64*1024), 1024*1024) // 1MB max token
@@ -125,8 +179,10 @@ func (c *Client) RunWithCallback(ctx context.Context, workdir, prompt string, ca
 			outputBuf.WriteString(line)
 			outputBuf.WriteString("\n")
 			outputMu.Unlock()
+
+			// Send stderr directly to callback for visibility
 			if callback != nil {
-				callback(line)
+				callback("[stderr] " + line)
 			}
 		}
 		scanErrs <- scanner.Err()
@@ -157,19 +213,13 @@ func (c *Client) RunWithCallback(ctx context.Context, workdir, prompt string, ca
 		}, fmt.Errorf("claude: %w\n%s", err, string(out))
 	}
 
-	return c.parseResult(out)
+	return c.parseStreamResult(out)
 }
 
 func (c *Client) parseResult(out []byte) (*Result, error) {
 	// Try parsing JSON response
 	var resp jsonResponse
 	if jsonErr := json.Unmarshal(out, &resp); jsonErr == nil {
-		c.logger.Info("claude completed",
-			"duration_ms", resp.DurationMs,
-			"cost_usd", resp.TotalCostUSD,
-			"turns", resp.NumTurns,
-			"session_id", resp.SessionID)
-
 		return &Result{
 			Success:      !resp.IsError,
 			Output:       resp.Result,
@@ -187,6 +237,66 @@ func (c *Client) parseResult(out []byte) (*Result, error) {
 	}, nil
 }
 
+// parseStreamResult parses stream-json format output
+func (c *Client) parseStreamResult(out []byte) (*Result, error) {
+	lines := strings.Split(string(out), "\n")
+	var resultData *resultEvent
+
+	// Scan for result event in stream-json output
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+
+		var evt resultEvent
+		if err := json.Unmarshal([]byte(line), &evt); err == nil && evt.Type == "result" {
+			resultData = &evt
+			break
+		}
+	}
+
+	if resultData != nil {
+		return &Result{
+			Success:      !resultData.IsError,
+			Output:       resultData.Result,
+			DurationMs:   resultData.DurationMs,
+			TotalCostUSD: resultData.TotalCostUSD,
+			SessionID:    resultData.SessionID,
+			NumTurns:     resultData.NumTurns,
+		}, nil
+	}
+
+	// Fallback: treat as success if no result event found
+	c.logger.Warn("no result event found in stream-json output")
+	return &Result{
+		Success: true,
+		Output:  string(out),
+	}, nil
+}
+
+// extractTextFromStreamEvent extracts displayable text from a stream-json event line
+func extractTextFromStreamEvent(line string) string {
+	var evt streamEvent
+	if err := json.Unmarshal([]byte(line), &evt); err != nil {
+		return ""
+	}
+
+	// Extract content_block_delta events with text_delta
+	if evt.Type == "stream_event" && evt.Event != nil {
+		if eventType, ok := evt.Event["type"].(string); ok && eventType == "content_block_delta" {
+			if delta, ok := evt.Event["delta"].(map[string]interface{}); ok {
+				if deltaType, ok := delta["type"].(string); ok && deltaType == "text_delta" {
+					if text, ok := delta["text"].(string); ok {
+						return text
+					}
+				}
+			}
+		}
+	}
+
+	return ""
+}
+
 // RunCommand spawns Claude Code CLI with a slash command.
 // outputDir specifies where to save full Claude output logs.
 func (c *Client) RunCommand(ctx context.Context, workdir, outputDir, command string, args ...string) (*Result, error) {
@@ -195,12 +305,27 @@ func (c *Client) RunCommand(ctx context.Context, workdir, outputDir, command str
 
 // RunCommandWithCallback spawns Claude command with live output streaming
 func (c *Client) RunCommandWithCallback(ctx context.Context, workdir, outputDir, command string, callback OutputCallback, args ...string) (*Result, error) {
-	cliArgs := []string{
-		"-p", fmt.Sprintf("/%s %s", command, strings.Join(args, " ")),
-		"--output-format", "json",
-		"--no-session-persistence",
-		"--dangerously-skip-permissions",
-		"--model", c.model,
+	var cliArgs []string
+	if callback != nil {
+		// Use stream-json for real-time streaming
+		cliArgs = []string{
+			"-p", fmt.Sprintf("/%s %s", command, strings.Join(args, " ")),
+			"--output-format", "stream-json",
+			"--verbose",
+			"--include-partial-messages",
+			"--no-session-persistence",
+			"--dangerously-skip-permissions",
+			"--model", c.model,
+		}
+	} else {
+		// Use regular json when no streaming needed
+		cliArgs = []string{
+			"-p", fmt.Sprintf("/%s %s", command, strings.Join(args, " ")),
+			"--output-format", "json",
+			"--no-session-persistence",
+			"--dangerously-skip-permissions",
+			"--model", c.model,
+		}
 	}
 
 	c.logger.Info("spawning claude command", "command", command, "workdir", workdir)
@@ -234,23 +359,47 @@ func (c *Client) RunCommandWithCallback(ctx context.Context, workdir, outputDir,
 		done := make(chan struct{}, 2)
 		scanErrs := make(chan error, 2)
 
-		// Stream stdout
+		// Stream stdout (parse stream-json events)
 		go func() {
 			scanner := bufio.NewScanner(stdout)
 			scanner.Buffer(make([]byte, 64*1024), 1024*1024) // 1MB max token
+			var lineBuf strings.Builder // Buffer for partial deltas
 			for scanner.Scan() {
 				line := scanner.Text()
 				outputMu.Lock()
 				outputBuf.WriteString(line)
 				outputBuf.WriteString("\n")
 				outputMu.Unlock()
-				callback(line)
+
+				// Parse stream-json event and extract text for callback
+				if callback != nil {
+					text := extractTextFromStreamEvent(line)
+					if text != "" {
+						lineBuf.WriteString(text)
+						// Split on newlines and send complete lines
+						content := lineBuf.String()
+						if idx := strings.LastIndex(content, "\n"); idx >= 0 {
+							lines := strings.Split(content[:idx+1], "\n")
+							for _, l := range lines {
+								if l != "" {
+									callback(l)
+								}
+							}
+							lineBuf.Reset()
+							lineBuf.WriteString(content[idx+1:])
+						}
+					}
+				}
+			}
+			// Flush remaining partial line if any
+			if callback != nil && lineBuf.Len() > 0 {
+				callback(lineBuf.String())
 			}
 			scanErrs <- scanner.Err()
 			done <- struct{}{}
 		}()
 
-		// Stream stderr
+		// Stream stderr (raw lines)
 		go func() {
 			scanner := bufio.NewScanner(stderr)
 			scanner.Buffer(make([]byte, 64*1024), 1024*1024) // 1MB max token
@@ -260,7 +409,11 @@ func (c *Client) RunCommandWithCallback(ctx context.Context, workdir, outputDir,
 				outputBuf.WriteString(line)
 				outputBuf.WriteString("\n")
 				outputMu.Unlock()
-				callback(line)
+
+				// Send stderr directly to callback for visibility
+				if callback != nil {
+					callback("[stderr] " + line)
+				}
 			}
 			scanErrs <- scanner.Err()
 			done <- struct{}{}
@@ -308,31 +461,37 @@ func (c *Client) RunCommandWithCallback(ctx context.Context, workdir, outputDir,
 		}, fmt.Errorf("claude command %s: %w\n%s", command, cmdErr, string(out))
 	}
 
-	var resp jsonResponse
-	if jsonErr := json.Unmarshal(out, &resp); jsonErr == nil {
-		c.logger.Info("claude completed",
-			"command", command,
-			"duration_ms", resp.DurationMs,
-			"cost_usd", resp.TotalCostUSD,
-			"turns", resp.NumTurns,
-			"session_id", resp.SessionID,
-			"output_file", logFile)
+	// Try parsing result based on whether streaming was used
+	var result *Result
+	var parseErr error
 
+	if callback != nil {
+		// Stream-json format
+		result, parseErr = c.parseStreamResult(out)
+	} else {
+		// Regular json format
+		result, parseErr = c.parseResult(out)
+	}
+
+	if parseErr != nil {
+		c.logger.Warn("failed to parse result", "err", parseErr)
 		return &Result{
-			Success:      !resp.IsError,
-			Output:       resp.Result,
-			OutputFile:   logFile,
-			DurationMs:   resp.DurationMs,
-			TotalCostUSD: resp.TotalCostUSD,
-			SessionID:    resp.SessionID,
-			NumTurns:     resp.NumTurns,
+			Success:    true,
+			Output:     string(out),
+			OutputFile: logFile,
 		}, nil
 	}
 
-	c.logger.Info("claude completed (non-json response)", "output_file", logFile)
-	return &Result{
-		Success:    true,
-		Output:     string(out),
-		OutputFile: logFile,
-	}, nil
+	// Add output file to result
+	result.OutputFile = logFile
+
+	c.logger.Info("claude completed",
+		"command", command,
+		"duration_ms", result.DurationMs,
+		"cost_usd", result.TotalCostUSD,
+		"turns", result.NumTurns,
+		"session_id", result.SessionID,
+		"output_file", logFile)
+
+	return result, nil
 }
