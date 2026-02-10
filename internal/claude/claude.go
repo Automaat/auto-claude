@@ -276,11 +276,15 @@ func extractTextFromStreamEvent(line string) string {
 		return ""
 	}
 
-	// Extract text_delta events
+	// Extract content_block_delta events with text_delta
 	if evt.Type == "stream_event" && evt.Event != nil {
-		if deltaType, ok := evt.Event["type"].(string); ok && deltaType == "text_delta" {
-			if delta, ok := evt.Event["delta"].(string); ok {
-				return delta
+		if eventType, ok := evt.Event["type"].(string); ok && eventType == "content_block_delta" {
+			if delta, ok := evt.Event["delta"].(map[string]interface{}); ok {
+				if deltaType, ok := delta["type"].(string); ok && deltaType == "text_delta" {
+					if text, ok := delta["text"].(string); ok {
+						return text
+					}
+				}
 			}
 		}
 	}
