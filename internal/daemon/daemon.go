@@ -101,18 +101,26 @@ func (d *Daemon) pollRepo(ctx context.Context, repo config.RepoConfig) error {
 
 	// Cache PR data for TUI snapshot
 	repoKey := repo.Owner + "/" + repo.Name
-	d.prCacheMu.Lock()
-	d.prCache[repoKey] = prs
 
-	// Cache Copilot review status for each PR if required (skip Renovate PRs)
+	// Fetch Copilot review status outside lock to avoid blocking cache reads during network calls
+	type copilotStatus struct {
+		prKey                string
+		hasCopilotReview     bool
+		hasUnresolvedCopilot bool
+	}
+	var copilotStatuses []copilotStatus
+
 	if *repo.RequireCopilotReview {
 		for _, pr := range prs {
 			prKey := workerKey(repo.Owner, repo.Name, pr.Number)
 
 			// Skip fetching review threads for Renovate PRs (mirrors worker behavior)
 			if isRenovateAuthor(pr.Author.Login) {
-				d.copilotReviewCache[prKey] = false
-				d.copilotUnresolvedCache[prKey] = false
+				copilotStatuses = append(copilotStatuses, copilotStatus{
+					prKey:                prKey,
+					hasCopilotReview:     false,
+					hasUnresolvedCopilot: false,
+				})
 				continue
 			}
 
@@ -122,24 +130,33 @@ func (d *Daemon) pollRepo(ctx context.Context, repo config.RepoConfig) error {
 
 			// Check top-level reviews
 			reviews, err := d.gh.GetReviews(ctx, repo.Owner, repo.Name, pr.Number)
-			if err == nil {
-				for _, r := range reviews {
-					if isCopilotAuthor(r.Author) {
-						hasCopilotReview = true
-						break
-					}
+			if err != nil {
+				d.logger.Warn("failed to get reviews for Copilot status", "pr", pr.Number, "err", err)
+				// Skip cache update for this PR on error - preserve previous value
+				continue
+			}
+
+			for _, r := range reviews {
+				if isCopilotAuthor(r.Author) {
+					hasCopilotReview = true
+					break
 				}
 			}
 
-			// Check review threads (inline comments)
-			threads, err := d.gh.GetReviewThreads(ctx, repo.Owner, repo.Name, pr.Number)
-			if err == nil {
+			// Only fetch review threads if Copilot review exists
+			if hasCopilotReview {
+				threads, err := d.gh.GetReviewThreads(ctx, repo.Owner, repo.Name, pr.Number)
+				if err != nil {
+					d.logger.Warn("failed to get review threads for Copilot status", "pr", pr.Number, "err", err)
+					// Skip cache update for this PR on error - preserve previous value
+					continue
+				}
+
 				for _, t := range threads {
 					hasCopilotInThread := false
 					for _, c := range t.Comments {
 						if isCopilotAuthor(c.Author) {
 							hasCopilotInThread = true
-							hasCopilotReview = true
 							break
 						}
 					}
@@ -149,9 +166,20 @@ func (d *Daemon) pollRepo(ctx context.Context, repo config.RepoConfig) error {
 				}
 			}
 
-			d.copilotReviewCache[prKey] = hasCopilotReview
-			d.copilotUnresolvedCache[prKey] = hasUnresolvedCopilot
+			copilotStatuses = append(copilotStatuses, copilotStatus{
+				prKey:                prKey,
+				hasCopilotReview:     hasCopilotReview,
+				hasUnresolvedCopilot: hasUnresolvedCopilot,
+			})
 		}
+	}
+
+	// Update cache with lock held only for writes
+	d.prCacheMu.Lock()
+	d.prCache[repoKey] = prs
+	for _, status := range copilotStatuses {
+		d.copilotReviewCache[status.prKey] = status.hasCopilotReview
+		d.copilotUnresolvedCache[status.prKey] = status.hasUnresolvedCopilot
 	}
 	d.prCacheMu.Unlock()
 

@@ -116,14 +116,27 @@ func (w *Worker) Run(ctx context.Context) error {
 			}
 			w.cachedReviews = reviews
 
-			threads, err := w.gh.GetReviewThreads(ctx, w.repo.Owner, w.repo.Name, w.pr.Number)
-			if err != nil {
-				w.logger.Error("failed to get review threads", "err", err)
-				consecutiveFailures++
-				w.sleep(ctx, consecutiveFailures)
-				continue
+			// Only fetch review threads if Copilot review exists
+			hasCopilotReview := false
+			for _, r := range reviews {
+				if isCopilotAuthor(r.Author) {
+					hasCopilotReview = true
+					break
+				}
 			}
-			w.cachedReviewThreads = threads
+
+			if hasCopilotReview {
+				threads, err := w.gh.GetReviewThreads(ctx, w.repo.Owner, w.repo.Name, w.pr.Number)
+				if err != nil {
+					w.logger.Error("failed to get review threads", "err", err)
+					consecutiveFailures++
+					w.sleep(ctx, consecutiveFailures)
+					continue
+				}
+				w.cachedReviewThreads = threads
+			} else {
+				w.cachedReviewThreads = nil
+			}
 		}
 
 		// Reset counter after successful PR and thread fetch
