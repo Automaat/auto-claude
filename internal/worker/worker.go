@@ -108,7 +108,16 @@ func (w *Worker) Run(ctx context.Context) error {
 		w.pr = *pr
 
 		// Fetch reviews and review threads for Copilot review status (only if required and not Renovate)
-		if *w.repo.RequireCopilotReview && !isRenovateAuthor(w.pr.Author.Login) {
+		requireCopilot := w.repo.RequireCopilotReview != nil && *w.repo.RequireCopilotReview
+		isRenovate := isRenovateAuthor(w.pr.Author.Login)
+
+		w.logger.Debug("copilot review check",
+			"require_copilot_review", requireCopilot,
+			"is_renovate", isRenovate,
+			"author", w.pr.Author.Login,
+			"config_ptr_nil", w.repo.RequireCopilotReview == nil)
+
+		if requireCopilot && !isRenovate {
 			reviews, err := w.gh.GetReviews(ctx, w.repo.Owner, w.repo.Name, w.pr.Number)
 			if err != nil {
 				w.logger.Error("failed to get reviews", "err", err)
@@ -138,6 +147,15 @@ func (w *Worker) Run(ctx context.Context) error {
 				w.cachedReviewThreads = threads
 			} else {
 				w.cachedReviewThreads = nil
+			}
+		} else {
+			// Reviews not required or Renovate PR - clear cached reviews
+			w.cachedReviews = nil
+			w.cachedReviewThreads = nil
+			if !isRenovate && !requireCopilot {
+				w.logger.Warn("copilot review check skipped unexpectedly",
+					"require_copilot_review", requireCopilot,
+					"config_ptr", w.repo.RequireCopilotReview)
 			}
 		}
 
@@ -234,8 +252,27 @@ func (w *Worker) evaluate() state {
 	}
 
 	// Check review status before merging (if required and not Renovate)
-	if *w.repo.RequireCopilotReview && !isRenovateAuthor(w.pr.Author.Login) {
+	requireCopilot := w.repo.RequireCopilotReview != nil && *w.repo.RequireCopilotReview
+	isRenovate := isRenovateAuthor(w.pr.Author.Login)
+
+	w.logger.Debug("evaluate copilot requirement",
+		"require_copilot_review", requireCopilot,
+		"is_renovate", isRenovate,
+		"author", w.pr.Author.Login,
+		"cached_reviews_count", len(w.cachedReviews),
+		"cached_threads_count", len(w.cachedReviewThreads))
+
+	if requireCopilot && !isRenovate {
+		// Safety check: ensure reviews were fetched
+		if w.cachedReviews == nil {
+			w.logger.Error("copilot review required but reviews not fetched - blocking merge",
+				"pr", w.pr.Number,
+				"author", w.pr.Author.Login)
+			return stateChecksPending
+		}
+
 		copilotStatus := w.checkCopilotReviewStatus()
+		w.logger.Debug("copilot review status", "status", copilotStatus)
 		switch copilotStatus {
 		case copilotNotReviewed:
 			w.logger.Info("waiting for Copilot review to complete")
@@ -286,14 +323,25 @@ const (
 
 func (w *Worker) checkCopilotReviewStatus() copilotReviewStatus {
 	var hasCopilotReview bool
+	var hasApproval bool
 	var hasUnresolvedComment bool
 
-	// Check top-level reviews
+	// Check top-level reviews for latest non-dismissed state
+	// Process reviews in order to find most recent Copilot review
+	var latestCopilotState string
 	for _, r := range w.cachedReviews {
 		if isCopilotAuthor(r.Author) {
-			hasCopilotReview = true
-			break
+			// Only consider submitted reviews (ignore PENDING/DISMISSED)
+			if r.State != "PENDING" && r.State != "DISMISSED" {
+				hasCopilotReview = true
+				latestCopilotState = r.State
+			}
 		}
+	}
+
+	// Only consider APPROVED if it's the latest state
+	if latestCopilotState == "APPROVED" {
+		hasApproval = true
 	}
 
 	// Check review threads (inline comments)
@@ -312,7 +360,7 @@ func (w *Worker) checkCopilotReviewStatus() copilotReviewStatus {
 	if !hasCopilotReview {
 		return copilotNotReviewed
 	}
-	if hasUnresolvedComment {
+	if hasUnresolvedComment || !hasApproval {
 		return copilotUnresolved
 	}
 	return copilotResolved
