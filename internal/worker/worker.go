@@ -248,15 +248,22 @@ func (w *Worker) evaluate() state {
 	}
 
 	// Check if reviews are approved
-	if w.pr.ReviewDecision == "APPROVED" {
-		// Reviews approved, continue to ready check
-		w.logger.Debug("reviews approved", "reviewDecision", w.pr.ReviewDecision)
-	} else if w.pr.MergeStateStatus == "BLOCKED" {
-		w.logger.Debug("PR blocked by GitHub",
-			"mergeStateStatus", w.pr.MergeStateStatus,
+	if w.pr.ReviewDecision != "APPROVED" {
+		w.logger.Debug("reviews not approved; waiting before merge",
 			"reviewDecision", w.pr.ReviewDecision,
+			"mergeStateStatus", w.pr.MergeStateStatus,
 			"mergeable", w.pr.Mergeable)
 		return stateReviewsPending
+	}
+
+	// Reviews approved, continue to ready check
+	w.logger.Debug("reviews approved", "reviewDecision", w.pr.ReviewDecision)
+
+	// Special handling for BEHIND: allow merge attempt which will trigger UpdateBranch
+	if w.pr.MergeStateStatus == "BEHIND" {
+		w.logger.Debug("PR behind base branch, will attempt merge to trigger update",
+			"mergeStateStatus", w.pr.MergeStateStatus)
+		return stateReady
 	}
 
 	if w.pr.MergeStateStatus != "CLEAN" {

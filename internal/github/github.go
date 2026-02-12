@@ -374,7 +374,7 @@ func (c *Client) GetComments(ctx context.Context, owner, repo string, number int
 	query := `query($owner: String!, $repo: String!, $pr: Int!) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $pr) {
-      comments(first: 100) {
+      comments(last: 100) {
         nodes {
           body
         }

@@ -140,6 +140,9 @@ func (c *Config) validate() error {
 		default:
 			return fmt.Errorf("repos[%d]: invalid merge_method %q (squash|merge)", i, r.MergeMethod)
 		}
+		if r.ReviewRequestComment != nil && r.ReviewRequestComment.Enabled && r.ReviewRequestComment.Message == "" {
+			return fmt.Errorf("repos[%d]: review_request_comment.message required when enabled", i)
+		}
 	}
 	return nil
 }
