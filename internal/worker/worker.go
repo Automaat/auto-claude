@@ -282,17 +282,18 @@ func (w *Worker) evaluate() state {
 		case copilotResolved:
 			// Continue to merge readiness check
 		}
+	}
 
-		// Check if reviews are approved (only when reviews required)
-		if w.pr.ReviewDecision != "APPROVED" {
-			w.logger.Debug("reviews not approved; waiting before merge",
-				"reviewDecision", w.pr.ReviewDecision,
-				"mergeStateStatus", w.pr.MergeStateStatus,
-				"mergeable", w.pr.Mergeable)
-			return stateReviewsPending
-		}
-
-		// Reviews approved, continue to ready check
+	// Check branch protection approval (separate from Copilot review)
+	// reviewDecision is set by GitHub based on branch protection rules
+	if w.pr.ReviewDecision != "" && w.pr.ReviewDecision != "APPROVED" {
+		w.logger.Debug("reviews not approved; waiting before merge",
+			"reviewDecision", w.pr.ReviewDecision,
+			"mergeStateStatus", w.pr.MergeStateStatus,
+			"mergeable", w.pr.Mergeable)
+		return stateReviewsPending
+	}
+	if w.pr.ReviewDecision == "APPROVED" {
 		w.logger.Debug("reviews approved", "reviewDecision", w.pr.ReviewDecision)
 	}
 
@@ -323,25 +324,16 @@ const (
 
 func (w *Worker) checkCopilotReviewStatus() copilotReviewStatus {
 	var hasCopilotReview bool
-	var hasApproval bool
 	var hasUnresolvedComment bool
 
 	// Check top-level reviews for latest non-dismissed state
-	// Process reviews in order to find most recent Copilot review
-	var latestCopilotState string
 	for _, r := range w.cachedReviews {
 		if isCopilotAuthor(r.Author) {
 			// Only consider submitted reviews (ignore PENDING/DISMISSED)
 			if r.State != "PENDING" && r.State != "DISMISSED" {
 				hasCopilotReview = true
-				latestCopilotState = r.State
 			}
 		}
-	}
-
-	// Only consider APPROVED if it's the latest state
-	if latestCopilotState == "APPROVED" {
-		hasApproval = true
 	}
 
 	// Check review threads (inline comments)
@@ -360,7 +352,9 @@ func (w *Worker) checkCopilotReviewStatus() copilotReviewStatus {
 	if !hasCopilotReview {
 		return copilotNotReviewed
 	}
-	if hasUnresolvedComment || !hasApproval {
+	// Copilot typically provides COMMENTED state (not APPROVED)
+	// Only check for unresolved threads; approval enforced via reviewDecision
+	if hasUnresolvedComment {
 		return copilotUnresolved
 	}
 	return copilotResolved
