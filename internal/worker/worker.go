@@ -305,6 +305,13 @@ func (w *Worker) evaluate() state {
 		return stateReady
 	}
 
+	// BLOCKED means branch protection requires approval
+	if w.pr.MergeStateStatus == "BLOCKED" {
+		w.logger.Debug("PR blocked by branch protection, waiting for approval",
+			"mergeStateStatus", w.pr.MergeStateStatus)
+		return stateReviewsPending
+	}
+
 	if w.pr.MergeStateStatus != "CLEAN" {
 		w.logger.Debug("PR merge state not clean",
 			"mergeStateStatus", w.pr.MergeStateStatus,
