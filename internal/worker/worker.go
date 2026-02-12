@@ -108,6 +108,11 @@ func (w *Worker) Run(ctx context.Context) error {
 		w.pr = *pr
 
 		// Fetch reviews and review threads for Copilot review status (only if required and not Renovate)
+		w.logger.Debug("copilot review check",
+			"require_copilot_review", *w.repo.RequireCopilotReview,
+			"is_renovate", isRenovateAuthor(w.pr.Author.Login),
+			"author", w.pr.Author.Login)
+
 		if *w.repo.RequireCopilotReview && !isRenovateAuthor(w.pr.Author.Login) {
 			reviews, err := w.gh.GetReviews(ctx, w.repo.Owner, w.repo.Name, w.pr.Number)
 			if err != nil {
@@ -234,8 +239,14 @@ func (w *Worker) evaluate() state {
 	}
 
 	// Check review status before merging (if required and not Renovate)
+	w.logger.Debug("evaluate copilot requirement",
+		"require_copilot_review", *w.repo.RequireCopilotReview,
+		"is_renovate", isRenovateAuthor(w.pr.Author.Login),
+		"author", w.pr.Author.Login)
+
 	if *w.repo.RequireCopilotReview && !isRenovateAuthor(w.pr.Author.Login) {
 		copilotStatus := w.checkCopilotReviewStatus()
+		w.logger.Debug("copilot review status", "status", copilotStatus)
 		switch copilotStatus {
 		case copilotNotReviewed:
 			w.logger.Info("waiting for Copilot review to complete")
@@ -286,13 +297,16 @@ const (
 
 func (w *Worker) checkCopilotReviewStatus() copilotReviewStatus {
 	var hasCopilotReview bool
+	var hasApproval bool
 	var hasUnresolvedComment bool
 
-	// Check top-level reviews
+	// Check top-level reviews for approval
 	for _, r := range w.cachedReviews {
 		if isCopilotAuthor(r.Author) {
 			hasCopilotReview = true
-			break
+			if r.State == "APPROVED" {
+				hasApproval = true
+			}
 		}
 	}
 
@@ -312,7 +326,7 @@ func (w *Worker) checkCopilotReviewStatus() copilotReviewStatus {
 	if !hasCopilotReview {
 		return copilotNotReviewed
 	}
-	if hasUnresolvedComment {
+	if hasUnresolvedComment || !hasApproval {
 		return copilotUnresolved
 	}
 	return copilotResolved
