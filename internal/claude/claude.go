@@ -120,7 +120,7 @@ func (c *Client) RunInTmux(ctx context.Context, sessionName, workdir, prompt str
 	}
 
 	// Build tmux command with proper terminal settings for Claude TUI
-	// Start Claude in interactive mode
+	// Start Claude in interactive mode with auto-approval
 	tmuxArgs := []string{
 		"new-session", "-d",
 		"-s", sessionName,
@@ -128,7 +128,7 @@ func (c *Client) RunInTmux(ctx context.Context, sessionName, workdir, prompt str
 		"-x", "200", // width
 		"-y", "50",  // height
 		"-e", "TERM=screen-256color",
-		"claude", "--model", c.model,
+		"claude", "--model", c.model, "--dangerously-skip-permissions",
 	}
 
 	// Create tmux session
