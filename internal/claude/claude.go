@@ -18,15 +18,47 @@ type Client struct {
 	model             string
 	useTmux           bool
 	tmuxSessionPrefix string
+	runID             string // unique ID for this daemon run
 	logger            *slog.Logger
 }
 
 func NewClient(model string, useTmux bool, tmuxSessionPrefix string, logger *slog.Logger) *Client {
+	runID := fmt.Sprintf("%d", time.Now().Unix())
+
+	// Clean up dangling sessions from previous runs when tmux enabled
+	if useTmux {
+		cleanupDanglingSessions(tmuxSessionPrefix, runID, logger)
+	}
+
 	return &Client{
 		model:             model,
 		useTmux:           useTmux,
 		tmuxSessionPrefix: tmuxSessionPrefix,
+		runID:             runID,
 		logger:            logger,
+	}
+}
+
+// cleanupDanglingSessions kills old auto-claude tmux sessions
+func cleanupDanglingSessions(prefix, currentRunID string, logger *slog.Logger) {
+	cmd := exec.Command("tmux", "ls", "-F", "#{session_name}")
+	out, err := cmd.Output()
+	if err != nil {
+		// tmux not running or no sessions - OK
+		return
+	}
+
+	sessions := strings.Split(string(out), "\n")
+	for _, session := range sessions {
+		session = strings.TrimSpace(session)
+		if session == "" {
+			continue
+		}
+		// Kill sessions matching our prefix but not current run
+		if strings.HasPrefix(session, prefix+"-") && !strings.Contains(session, "-"+currentRunID+"-") {
+			logger.Info("cleaning up dangling tmux session", "session", session)
+			_ = exec.Command("tmux", "kill-session", "-t", session).Run()
+		}
 	}
 }
 
@@ -38,11 +70,11 @@ func (c *Client) GenerateTmuxSessionName(workdir string) string {
 	return c.generateTmuxSessionName(workdir)
 }
 
-// generateTmuxSessionName creates a unique session name from workdir
+// generateTmuxSessionName creates a unique session name from workdir with run ID
 func (c *Client) generateTmuxSessionName(workdir string) string {
 	// Extract owner/repo/pr from workdir path
 	// e.g., /tmp/auto-claude-dev/worktrees/automaat-ai-casino/pr-609
-	// -> auto-claude-automaat-ai-casino-pr-609
+	// -> auto-claude-1234567890-automaat-ai-casino-pr-609
 	parts := strings.Split(filepath.Clean(workdir), string(filepath.Separator))
 
 	// Find worktrees index and extract repo/pr after it
@@ -51,17 +83,17 @@ func (c *Client) generateTmuxSessionName(workdir string) string {
 			// parts[i+1] is repo name, parts[i+2] is pr-XXX
 			repo := parts[i+1]
 			prPart := parts[i+2]
-			return fmt.Sprintf("%s-%s-%s", c.tmuxSessionPrefix, repo, prPart)
+			return fmt.Sprintf("%s-%s-%s-%s", c.tmuxSessionPrefix, c.runID, repo, prPart)
 		}
 	}
 
-	// Fallback: use last 2 path components
+	// Fallback: use last 2 path components with run ID
 	if len(parts) >= 2 {
-		return fmt.Sprintf("%s-%s-%s", c.tmuxSessionPrefix, parts[len(parts)-2], parts[len(parts)-1])
+		return fmt.Sprintf("%s-%s-%s-%s", c.tmuxSessionPrefix, c.runID, parts[len(parts)-2], parts[len(parts)-1])
 	}
 
-	// Ultimate fallback: hash workdir
-	return fmt.Sprintf("%s-%x", c.tmuxSessionPrefix, time.Now().UnixNano())
+	// Ultimate fallback: run ID + timestamp
+	return fmt.Sprintf("%s-%s-%x", c.tmuxSessionPrefix, c.runID, time.Now().UnixNano())
 }
 
 type Result struct {
