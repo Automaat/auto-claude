@@ -176,10 +176,28 @@ func (c *Client) RunInTmux(ctx context.Context, sessionName, workdir, prompt str
 		}, fmt.Errorf("create tmux session: %w\n%s", err, string(out))
 	}
 
-	// Wait for Claude TUI to initialize
-	time.Sleep(2 * time.Second)
+	// Wait for Claude TUI to initialize and show confirmation prompt
+	time.Sleep(1 * time.Second)
 
-	// Send the prompt via tmux send-keys
+	// Accept the "dangerously skip permissions" confirmation
+	// Send Down arrow to select "Yes, I accept"
+	downCmd := exec.CommandContext(ctx, "tmux", "send-keys", "-t", sessionName, "Down")
+	if err := downCmd.Run(); err != nil {
+		c.logger.Warn("failed to send Down to tmux", "err", err)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Send Enter to confirm
+	confirmCmd := exec.CommandContext(ctx, "tmux", "send-keys", "-t", sessionName, "Enter")
+	if err := confirmCmd.Run(); err != nil {
+		c.logger.Warn("failed to send confirmation Enter to tmux", "err", err)
+	}
+
+	// Wait for Claude to finish accepting and show prompt input
+	time.Sleep(500 * time.Millisecond)
+
+	// Send the actual prompt via tmux send-keys
 	sendCmd := exec.CommandContext(ctx, "tmux", "send-keys", "-t", sessionName, "-l", prompt)
 	if err := sendCmd.Run(); err != nil {
 		c.logger.Warn("failed to send prompt to tmux", "err", err)
