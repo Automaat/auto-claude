@@ -212,7 +212,7 @@ func renderSessions(sessions []ClaudeSessionState, selectedIdx int) string {
 		line := fmt.Sprintf("%s %s #%d - %s (%s)",
 			marker, s.Repo, s.PRNumber, s.Action, duration)
 		if s.TmuxSession != "" {
-			line += fmt.Sprintf(" [tmux: %s]", s.TmuxSession)
+			line += fmt.Sprintf(" [tmux attach -t %s]", s.TmuxSession)
 		}
 		b.WriteString(style.Render(line))
 		b.WriteString("\n")
