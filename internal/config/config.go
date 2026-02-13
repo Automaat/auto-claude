@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -93,6 +94,12 @@ func (c *Config) setDefaults() error {
 	}
 	if c.Claude.TmuxSessionPrefix == "" {
 		c.Claude.TmuxSessionPrefix = "auto-claude"
+	}
+	// Validate tmux availability if use_tmux is enabled
+	if c.Claude.UseTmux {
+		if _, err := exec.LookPath("tmux"); err != nil {
+			return fmt.Errorf("use_tmux is enabled but tmux is not installed or not in PATH: %w", err)
+		}
 	}
 	if c.Log.Level == "" {
 		c.Log.Level = "info"

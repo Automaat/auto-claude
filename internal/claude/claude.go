@@ -155,6 +155,17 @@ func (c *Client) RunInTmux(ctx context.Context, sessionName, workdir, prompt str
 		return nil, fmt.Errorf("create log file: %w", err)
 	}
 
+	// Check if session already exists and kill it to avoid collision
+	hasSessionCmd := exec.CommandContext(ctx, "tmux", "has-session", "-t", sessionName)
+	if err := hasSessionCmd.Run(); err == nil {
+		// Session exists, kill it
+		c.logger.Warn("tmux session already exists, killing old session", "session", sessionName)
+		killCmd := exec.CommandContext(ctx, "tmux", "kill-session", "-t", sessionName)
+		if killErr := killCmd.Run(); killErr != nil {
+			c.logger.Warn("failed to kill existing tmux session", "session", sessionName, "err", killErr)
+		}
+	}
+
 	// Build tmux command with proper terminal settings for Claude TUI
 	// Start Claude in interactive mode WITHOUT -p flag to get full TUI
 	tmuxArgs := []string{

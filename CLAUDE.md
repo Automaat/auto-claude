@@ -149,8 +149,8 @@ tmux attach -t auto-claude-myorg-myrepo-pr-123
 **View session output:**
 
 ```bash
-# Logs saved to: {workdir}/{owner}/{repo}/worktrees/pr-{num}/.auto-claude-logs/tmux-{session}.log
-tail -f /tmp/auto-claude/myorg/myrepo/worktrees/pr-123/.auto-claude-logs/tmux-auto-claude-myorg-myrepo-pr-123.log
+# Logs saved to: {workdir}/worktrees/{owner}-{repo}/pr-{num}/.auto-claude-logs/tmux-{session}.log
+tail -f /tmp/auto-claude/worktrees/myorg-myrepo/pr-123/.auto-claude-logs/tmux-auto-claude-myorg-myrepo-pr-123.log
 ```
 
 ### Benefits
@@ -159,7 +159,7 @@ tail -f /tmp/auto-claude/myorg/myrepo/worktrees/pr-123/.auto-claude-logs/tmux-au
 - **Manual intervention:** Attach mid-session to provide additional context or make decisions
 - **Real-time monitoring:** See Claude's thinking and tool use as it happens
 - **Debugging:** Attach when worker stuck to see what Claude is waiting for
-- **Persistent logs:** Full output captured via tmux pipe-pane for later review
+- **Persistent logs:** Full output captured via periodic tmux capture-pane snapshots for later review
 - **Session persistence:** Can attach/detach without interrupting Claude's work
 
 ### Cleanup
@@ -226,9 +226,12 @@ Each PR worker progresses through states:
 **Tmux mode (interactive):**
 
 ```bash
-# Run in tmux with minimal flags for full interactivity
+# Start Claude TUI in a detached tmux session (no prompt passed via -p)
 tmux new-session -d -s auto-claude-owner-repo-pr-123 -c /workdir \
-  claude -p "prompt" --dangerously-skip-permissions --model opus
+  claude --dangerously-skip-permissions --model opus
+
+# After TUI is ready, send the prompt into the session and press Enter
+tmux send-keys -t auto-claude-owner-repo-pr-123 'prompt' C-m
 ```
 
 **Direct mode (non-interactive):**
