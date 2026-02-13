@@ -82,6 +82,8 @@ workdir: /tmp/auto-claude            # base dir for git worktrees
 
 claude:
   model: opus                        # opus | sonnet | haiku
+  use_tmux: false                    # run Claude sessions in tmux (default: false)
+  tmux_session_prefix: auto-claude   # prefix for tmux session names (default: auto-claude)
 
 repos:
   - owner: myorg
@@ -105,11 +107,88 @@ Use for local development:
 - Set log level to debug
 - Use separate workdir to avoid conflicts
 
+## Tmux Integration
+
+### Overview
+
+Run Claude sessions in tmux in full interactive mode. When enabled, each PR worker spawns Claude in a dedicated tmux session with normal interactive behavior - you can attach to observe progress or provide manual input if Claude gets stuck or needs clarification.
+
+### Configuration
+
+Enable in config.yaml:
+
+```yaml
+claude:
+  use_tmux: true
+  tmux_session_prefix: auto-claude  # optional, default shown
+```
+
+### Session Naming
+
+Sessions named: `{prefix}-{owner}-{repo}-pr-{number}`
+
+Example: `auto-claude-myorg-myrepo-pr-123`
+
+### Usage
+
+**List active sessions:**
+
+```bash
+tmux ls | grep auto-claude
+```
+
+**Attach to session:**
+
+```bash
+# Attach to specific PR
+tmux attach -t auto-claude-myorg-myrepo-pr-123
+
+# Detach without killing: Ctrl-b d
+```
+
+**View session output:**
+
+```bash
+# Logs saved to: {workdir}/{owner}/{repo}/worktrees/pr-{num}/.auto-claude-logs/tmux-{session}.log
+tail -f /tmp/auto-claude/myorg/myrepo/worktrees/pr-123/.auto-claude-logs/tmux-auto-claude-myorg-myrepo-pr-123.log
+```
+
+### Benefits
+
+- **Full interactivity:** Claude runs in normal interactive mode, not JSON streaming
+- **Manual intervention:** Attach mid-session to provide additional context or make decisions
+- **Real-time monitoring:** See Claude's thinking and tool use as it happens
+- **Debugging:** Attach when worker stuck to see what Claude is waiting for
+- **Persistent logs:** Full output captured via tmux pipe-pane for later review
+- **Session persistence:** Can attach/detach without interrupting Claude's work
+
+### Cleanup
+
+Sessions automatically cleaned up when:
+
+- Claude completes successfully
+- Context cancelled (daemon shutdown, worker timeout)
+- Session exits unexpectedly
+
+Orphaned sessions (daemon crash):
+
+```bash
+# List all auto-claude sessions
+tmux ls | grep auto-claude
+
+# Kill specific session
+tmux kill-session -t auto-claude-myorg-myrepo-pr-123
+
+# Kill all auto-claude sessions
+tmux ls | grep auto-claude | cut -d: -f1 | xargs -I {} tmux kill-session -t {}
+```
+
 ## Logging
 
 ### Colors
 
 Log levels colored when stderr is TTY:
+
 - DEBUG: gray
 - INFO: cyan
 - WARN: yellow
@@ -142,23 +221,33 @@ Each PR worker progresses through states:
 
 ## Claude Code Integration
 
-### Invocation Pattern
+### Invocation Modes
+
+**Tmux mode (interactive):**
+
+```bash
+# Run in tmux with minimal flags for full interactivity
+tmux new-session -d -s auto-claude-owner-repo-pr-123 -c /workdir \
+  claude -p "prompt" --dangerously-skip-permissions --model opus
+```
+
+**Direct mode (non-interactive):**
 
 ```go
-// Summary-only logging
-cmd := exec.CommandContext(ctx, "claude", args...)
-output, err := cmd.CombinedOutput()
-if err != nil {
-    logger.Error("claude invocation failed", "err", err, "summary", extractSummary(output))
-    return err
-}
-logger.Info("claude action completed", "summary", extractSummary(output))
+// Use stream-json for automated parsing
+cmd := exec.CommandContext(ctx, "claude",
+  "-p", prompt,
+  "--output-format", "stream-json",
+  "--no-session-persistence",
+  "--dangerously-skip-permissions",
+  "--model", model)
 ```
 
 **Output handling:**
-- Log outcome + error message only (not full stdout)
-- Save full output to `{workdir}/{repo}/{pr}/claude-{action}-{timestamp}.log`
-- Parse output for success indicators (exit code, specific strings)
+
+- Tmux: Output captured via `tmux pipe-pane`, displayed in TUI, session kept for interaction
+- Direct: Parse JSON events for structured logging
+- Full output saved to `{workdir}/{repo}/{pr}/.auto-claude-logs/`
 
 ### Timeout Strategy
 
@@ -392,10 +481,12 @@ Set `require_copilot_review: false` to skip this check for specific repos (e.g.,
 **Symptoms:** Worker stuck, no log updates for >15 min
 
 **Fix:**
-1. Check Claude CLI timeout in worker action code
-2. Kill hung claude process manually: `pkill -f claude`
-3. Next poll cycle will retry PR
-4. Consider lowering timeout if frequent
+
+1. If tmux mode enabled: attach to session to see what Claude is doing: `tmux attach -t auto-claude-owner-repo-pr-123`
+2. Check Claude CLI timeout in worker action code
+3. Kill hung claude process manually: `pkill -f claude` or `tmux kill-session -t auto-claude-owner-repo-pr-123`
+4. Next poll cycle will retry PR
+5. Consider lowering timeout if frequent
 
 ### Merge conflicts not auto-resolving
 
