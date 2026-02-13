@@ -145,10 +145,14 @@ func (c *Client) RunInTmux(ctx context.Context, sessionName, workdir, prompt str
 	c.logger.Info("spawning interactive claude in tmux", "session", sessionName, "workdir", workdir, "prompt_len", len(prompt))
 	c.logger.Debug("claude prompt", "prompt", prompt)
 
-	// Create log file for tmux pipe-pane
+	// Create log file for tmux output
 	logFile := filepath.Join(workdir, ".auto-claude-logs", fmt.Sprintf("tmux-%s.log", sessionName))
 	if err := os.MkdirAll(filepath.Dir(logFile), 0700); err != nil {
 		return nil, fmt.Errorf("create log dir: %w", err)
+	}
+	// Create empty log file immediately
+	if err := os.WriteFile(logFile, []byte{}, 0600); err != nil {
+		return nil, fmt.Errorf("create log file: %w", err)
 	}
 
 	// Build tmux command with proper terminal settings for Claude TUI
