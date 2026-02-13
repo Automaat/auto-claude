@@ -22,7 +22,8 @@ func (w *Worker) resolveConflicts(ctx context.Context, wtDir string) error {
 		w.repo.BaseBranch, w.repo.BaseBranch,
 	)
 
-	w.onClaudeStart("resolving_conflicts")
+	tmuxSession := w.claude.GenerateTmuxSessionName(wtDir)
+	w.onClaudeStart("resolving_conflicts", tmuxSession)
 	endCalled := false
 	defer func() {
 		if !endCalled {
@@ -77,7 +78,8 @@ func (w *Worker) fixChecks(ctx context.Context, wtDir string) error {
 		strings.Join(failing, ", "),
 	)
 
-	w.onClaudeStart("fixing_checks")
+	tmuxSession := w.claude.GenerateTmuxSessionName(wtDir)
+	w.onClaudeStart("fixing_checks", tmuxSession)
 	endCalled := false
 	defer func() {
 		if !endCalled {
@@ -208,7 +210,8 @@ func (w *Worker) fixReviews(ctx context.Context, wtDir string) error {
 		return fmt.Errorf("create output dir: %w", err)
 	}
 
-	w.onClaudeStart("fixing_reviews")
+	tmuxSession := w.claude.GenerateTmuxSessionName(wtDir)
+	w.onClaudeStart("fixing_reviews", tmuxSession)
 	endCalled := false
 	defer func() {
 		if !endCalled {
