@@ -156,7 +156,7 @@ func (c *Client) RunInTmux(ctx context.Context, sessionName, workdir, prompt str
 	}
 
 	// Build tmux command with proper terminal settings for Claude TUI
-	// Start Claude in interactive mode with auto-approval
+	// Start Claude in interactive mode with auto-approval and prompt
 	tmuxArgs := []string{
 		"new-session", "-d",
 		"-s", sessionName,
@@ -164,7 +164,7 @@ func (c *Client) RunInTmux(ctx context.Context, sessionName, workdir, prompt str
 		"-x", "200", // width
 		"-y", "50",  // height
 		"-e", "TERM=screen-256color",
-		"claude", "--model", c.model, "--dangerously-skip-permissions",
+		"claude", "-p", prompt, "--model", c.model, "--dangerously-skip-permissions",
 	}
 
 	// Create tmux session
@@ -176,21 +176,8 @@ func (c *Client) RunInTmux(ctx context.Context, sessionName, workdir, prompt str
 		}, fmt.Errorf("create tmux session: %w\n%s", err, string(out))
 	}
 
-	// Give Claude a moment to initialize its TUI
-	time.Sleep(2 * time.Second)
-
-	// Send the prompt via tmux send-keys
-	sendCmd := exec.CommandContext(ctx, "tmux", "send-keys", "-t", sessionName, "-l", prompt)
-	if err := sendCmd.Run(); err != nil {
-		c.logger.Warn("failed to send prompt to tmux", "err", err)
-	}
-
-	// Send Enter to submit the prompt
-	time.Sleep(100 * time.Millisecond)
-	enterCmd := exec.CommandContext(ctx, "tmux", "send-keys", "-t", sessionName, "Enter")
-	if err := enterCmd.Run(); err != nil {
-		c.logger.Warn("failed to send Enter to tmux", "err", err)
-	}
+	// Give Claude a moment to initialize and start processing the prompt
+	time.Sleep(1 * time.Second)
 
 	// Start goroutine to capture output from tmux scrollback buffer
 	if callback != nil {
