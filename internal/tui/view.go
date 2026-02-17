@@ -86,7 +86,7 @@ func renderDetailView(session ClaudeSessionState, scrollOffset int) string {
 		// Scroll indicator
 		if endIdx < len(session.Output) {
 			remaining := len(session.Output) - endIdx
-			b.WriteString(fmt.Sprintf("\n... %d more lines (press j/down to scroll) ...\n", remaining))
+			fmt.Fprintf(&b, "\n... %d more lines (press j/down to scroll) ...\n", remaining)
 		}
 	}
 
