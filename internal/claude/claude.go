@@ -327,7 +327,10 @@ func (c *Client) waitForSessionComplete(ctx context.Context, sessionName, workdi
 		return &Result{Success: false}, fmt.Errorf("get pane pid: %w", err)
 	}
 	var panePID int
-	fmt.Sscanf(strings.TrimSpace(string(pidOut)), "%d", &panePID)
+	if _, err := fmt.Sscanf(strings.TrimSpace(string(pidOut)), "%d", &panePID); err != nil {
+		_ = exec.Command("tmux", "kill-session", "-t", sessionName).Run()
+		return &Result{Success: false}, fmt.Errorf("parse pane pid: %w", err)
+	}
 	c.logger.Debug("tmux pane pid", "pid", panePID)
 
 	// Phase A: wait for Claude session file to appear (up to 30s)
@@ -395,7 +398,7 @@ func (c *Client) handleDeadPane(sessionName, logFile string) (*Result, error) {
 	exitOut, err := exitCodeCmd.Output()
 	var exitCode int
 	if err == nil {
-		fmt.Sscanf(strings.TrimSpace(string(exitOut)), "%d", &exitCode)
+		_, _ = fmt.Sscanf(strings.TrimSpace(string(exitOut)), "%d", &exitCode)
 	}
 	_ = exec.Command("tmux", "kill-session", "-t", sessionName).Run()
 	return c.readFinalResult(logFile, exitCode)
