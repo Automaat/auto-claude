@@ -9,18 +9,110 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
 )
 
-type Client struct {
-	model  string
-	logger *slog.Logger
+// Session discovery types for reading ~/.claude state files
+type claudeSessionFile struct {
+	PID       int    `json:"pid"`
+	SessionID string `json:"sessionId"`
+	CWD       string `json:"cwd"`
+	StartedAt int64  `json:"startedAt"`
 }
 
-func NewClient(model string, logger *slog.Logger) *Client {
-	return &Client{model: model, logger: logger}
+type sessionState struct {
+	msgType    string
+	hasToolUse bool
+	stale      bool
+}
+
+var nonAlphanumDash = regexp.MustCompile(`[^a-zA-Z0-9-]`)
+
+const staleThreshold = 5 * time.Second
+
+type Client struct {
+	model             string
+	useTmux           bool
+	tmuxSessionPrefix string
+	runID             string // unique ID for this daemon run
+	logger            *slog.Logger
+}
+
+func NewClient(model string, useTmux bool, tmuxSessionPrefix string, logger *slog.Logger) *Client {
+	runID := fmt.Sprintf("%d", time.Now().Unix())
+
+	// Clean up dangling sessions from previous runs when tmux enabled
+	if useTmux {
+		cleanupDanglingSessions(tmuxSessionPrefix, runID, logger)
+	}
+
+	return &Client{
+		model:             model,
+		useTmux:           useTmux,
+		tmuxSessionPrefix: tmuxSessionPrefix,
+		runID:             runID,
+		logger:            logger,
+	}
+}
+
+// cleanupDanglingSessions kills old auto-claude tmux sessions
+func cleanupDanglingSessions(prefix, currentRunID string, logger *slog.Logger) {
+	cmd := exec.Command("tmux", "ls", "-F", "#{session_name}")
+	out, err := cmd.Output()
+	if err != nil {
+		// tmux not running or no sessions - OK
+		return
+	}
+
+	sessions := strings.Split(string(out), "\n")
+	for _, session := range sessions {
+		session = strings.TrimSpace(session)
+		if session == "" {
+			continue
+		}
+		// Kill sessions matching our prefix but not current run
+		if strings.HasPrefix(session, prefix+"-") && !strings.Contains(session, "-"+currentRunID+"-") {
+			logger.Info("cleaning up dangling tmux session", "session", session)
+			_ = exec.Command("tmux", "kill-session", "-t", session).Run()
+		}
+	}
+}
+
+// GenerateTmuxSessionName returns the tmux session name for a workdir (empty if tmux disabled)
+func (c *Client) GenerateTmuxSessionName(workdir string) string {
+	if !c.useTmux {
+		return ""
+	}
+	return c.generateTmuxSessionName(workdir)
+}
+
+// generateTmuxSessionName creates a unique session name from workdir with run ID
+func (c *Client) generateTmuxSessionName(workdir string) string {
+	// Extract owner/repo/pr from workdir path
+	// e.g., /tmp/auto-claude-dev/worktrees/automaat-ai-casino/pr-609
+	// -> auto-claude-1234567890-automaat-ai-casino-pr-609
+	parts := strings.Split(filepath.Clean(workdir), string(filepath.Separator))
+
+	// Find worktrees index and extract repo/pr after it
+	for i, part := range parts {
+		if part == "worktrees" && i+2 < len(parts) {
+			// parts[i+1] is repo name, parts[i+2] is pr-XXX
+			repo := parts[i+1]
+			prPart := parts[i+2]
+			return fmt.Sprintf("%s-%s-%s-%s", c.tmuxSessionPrefix, c.runID, repo, prPart)
+		}
+	}
+
+	// Fallback: use last 2 path components with run ID
+	if len(parts) >= 2 {
+		return fmt.Sprintf("%s-%s-%s-%s", c.tmuxSessionPrefix, c.runID, parts[len(parts)-2], parts[len(parts)-1])
+	}
+
+	// Ultimate fallback: run ID + timestamp
+	return fmt.Sprintf("%s-%s-%x", c.tmuxSessionPrefix, c.runID, time.Now().UnixNano())
 }
 
 type Result struct {
@@ -67,8 +159,390 @@ func (c *Client) Run(ctx context.Context, workdir, prompt string) (*Result, erro
 	return c.RunWithCallback(ctx, workdir, prompt, nil)
 }
 
+// RunInTmux spawns Claude in a tmux session in interactive mode
+func (c *Client) RunInTmux(ctx context.Context, sessionName, workdir, prompt string, callback OutputCallback) (*Result, error) {
+	c.logger.Info("spawning interactive claude in tmux", "session", sessionName, "workdir", workdir, "prompt_len", len(prompt))
+	c.logger.Debug("claude prompt", "prompt", prompt)
+
+	// Create log file for tmux output
+	logFile := filepath.Join(workdir, ".auto-claude-logs", fmt.Sprintf("tmux-%s.log", sessionName))
+	if err := os.MkdirAll(filepath.Dir(logFile), 0700); err != nil {
+		return nil, fmt.Errorf("create log dir: %w", err)
+	}
+	// Create empty log file immediately
+	if err := os.WriteFile(logFile, []byte{}, 0600); err != nil {
+		return nil, fmt.Errorf("create log file: %w", err)
+	}
+
+	// Check if session already exists and kill it to avoid collision
+	hasSessionCmd := exec.CommandContext(ctx, "tmux", "has-session", "-t", sessionName)
+	if err := hasSessionCmd.Run(); err == nil {
+		// Session exists, kill it
+		c.logger.Warn("tmux session already exists, killing old session", "session", sessionName)
+		killCmd := exec.CommandContext(ctx, "tmux", "kill-session", "-t", sessionName)
+		if killErr := killCmd.Run(); killErr != nil {
+			c.logger.Warn("failed to kill existing tmux session", "session", sessionName, "err", killErr)
+		}
+	}
+
+	// Build tmux command with proper terminal settings for Claude TUI
+	// Start Claude in interactive mode WITHOUT -p flag to get full TUI
+	tmuxArgs := []string{
+		"new-session", "-d",
+		"-s", sessionName,
+		"-c", workdir,
+		"-x", "200", // width
+		"-y", "50", // height
+		"-e", "TERM=screen-256color",
+		"claude", "--model", c.model, "--dangerously-skip-permissions",
+	}
+
+	// Create tmux session
+	createCmd := exec.CommandContext(ctx, "tmux", tmuxArgs...)
+	if out, err := createCmd.CombinedOutput(); err != nil {
+		return &Result{
+			Success: false,
+			Output:  string(out),
+		}, fmt.Errorf("create tmux session: %w\n%s", err, string(out))
+	}
+
+	// Enable remain-on-exit to capture exit status after Claude closes
+	remainCmd := exec.CommandContext(ctx, "tmux", "set-option", "-t", sessionName, "remain-on-exit", "on")
+	if err := remainCmd.Run(); err != nil {
+		c.logger.Warn("failed to set remain-on-exit", "err", err)
+	}
+
+	// Wait for Claude TUI to initialize and show confirmation prompt
+	time.Sleep(1 * time.Second)
+
+	// Accept the "dangerously skip permissions" confirmation
+	// Send Down arrow to select "Yes, I accept"
+	downCmd := exec.CommandContext(ctx, "tmux", "send-keys", "-t", sessionName, "Down")
+	if err := downCmd.Run(); err != nil {
+		c.logger.Warn("failed to send Down to tmux", "err", err)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Send Enter to confirm
+	confirmCmd := exec.CommandContext(ctx, "tmux", "send-keys", "-t", sessionName, "Enter")
+	if err := confirmCmd.Run(); err != nil {
+		c.logger.Warn("failed to send confirmation Enter to tmux", "err", err)
+	}
+
+	// Wait for Claude to finish accepting and show prompt input
+	time.Sleep(500 * time.Millisecond)
+
+	// Send the actual prompt via tmux send-keys
+	sendCmd := exec.CommandContext(ctx, "tmux", "send-keys", "-t", sessionName, "-l", prompt)
+	if err := sendCmd.Run(); err != nil {
+		c.logger.Warn("failed to send prompt to tmux", "err", err)
+	}
+
+	// Send Enter to submit the prompt
+	time.Sleep(100 * time.Millisecond)
+	enterCmd := exec.CommandContext(ctx, "tmux", "send-keys", "-t", sessionName, "Enter")
+	if err := enterCmd.Run(); err != nil {
+		c.logger.Warn("failed to send Enter to tmux", "err", err)
+	}
+
+	// Start goroutine to capture output
+	if callback != nil {
+		go c.captureFromTmux(ctx, sessionName, callback)
+	}
+
+	// Save output to log file periodically
+	go c.savePeriodicSnapshot(ctx, sessionName, logFile)
+
+	// Wait for session to complete (monitors ~/.claude JSONL state)
+	return c.waitForSessionComplete(ctx, sessionName, workdir, logFile)
+}
+
+// captureFromTmux captures output from tmux pane scrollback and streams to callback
+func (c *Client) captureFromTmux(ctx context.Context, sessionName string, callback OutputCallback) {
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	var lastLineCount int
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			// Capture pane content
+			cmd := exec.Command("tmux", "capture-pane", "-t", sessionName, "-p", "-S", "-1000")
+			out, err := cmd.Output()
+			if err != nil {
+				// Session might have ended
+				continue
+			}
+
+			lines := strings.Split(string(out), "\n")
+			if len(lines) > lastLineCount {
+				// Send new lines to callback
+				for i := lastLineCount; i < len(lines); i++ {
+					if strings.TrimSpace(lines[i]) != "" {
+						callback(lines[i])
+					}
+				}
+				lastLineCount = len(lines)
+			}
+		}
+	}
+}
+
+// savePeriodicSnapshot saves tmux pane content to log file periodically
+func (c *Client) savePeriodicSnapshot(ctx context.Context, sessionName, logFile string) {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			// Final save on exit
+			cmd := exec.Command("tmux", "capture-pane", "-t", sessionName, "-p", "-S", "-1000")
+			if out, err := cmd.Output(); err == nil {
+				_ = os.WriteFile(logFile, out, 0600)
+			}
+			return
+		case <-ticker.C:
+			cmd := exec.Command("tmux", "capture-pane", "-t", sessionName, "-p", "-S", "-1000")
+			if out, err := cmd.Output(); err == nil {
+				_ = os.WriteFile(logFile, out, 0600)
+			}
+		}
+	}
+}
+
+// waitForSessionComplete monitors ~/.claude JSONL state to detect completion
+func (c *Client) waitForSessionComplete(ctx context.Context, sessionName, workdir, logFile string) (*Result, error) {
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	// Get pane PID to find Claude's session file
+	pidCmd := exec.CommandContext(ctx, "tmux", "display-message", "-t", sessionName, "-p", "#{pane_pid}")
+	pidOut, err := pidCmd.Output()
+	if err != nil {
+		_ = exec.Command("tmux", "kill-session", "-t", sessionName).Run()
+		return &Result{Success: false}, fmt.Errorf("get pane pid: %w", err)
+	}
+	var panePID int
+	if _, err := fmt.Sscanf(strings.TrimSpace(string(pidOut)), "%d", &panePID); err != nil {
+		_ = exec.Command("tmux", "kill-session", "-t", sessionName).Run()
+		return &Result{Success: false}, fmt.Errorf("parse pane pid: %w", err)
+	}
+	c.logger.Debug("tmux pane pid", "pid", panePID)
+
+	// Phase A: wait for Claude session file to appear (up to 30s)
+	var session *claudeSessionFile
+	deadline := time.Now().Add(30 * time.Second)
+	for session == nil {
+		select {
+		case <-ctx.Done():
+			_ = exec.Command("tmux", "kill-session", "-t", sessionName).Run()
+			return &Result{Success: false, Output: "cancelled"}, ctx.Err()
+		case <-ticker.C:
+			if time.Now().After(deadline) {
+				_ = exec.Command("tmux", "kill-session", "-t", sessionName).Run()
+				return &Result{Success: false}, fmt.Errorf("timeout waiting for session file (pid %d)", panePID)
+			}
+			if isPaneDead(sessionName) {
+				return c.handleDeadPane(sessionName, logFile)
+			}
+			s, err := getSessionFromPID(panePID)
+			if err == nil {
+				session = s
+			}
+		}
+	}
+
+	c.logger.Debug("found claude session", "pid", panePID, "sessionId", session.SessionID, "cwd", session.CWD)
+
+	// Phase B: poll JSONL for completion
+	var exitSent bool
+	for {
+		select {
+		case <-ctx.Done():
+			_ = exec.Command("tmux", "kill-session", "-t", sessionName).Run()
+			return &Result{Success: false, Output: "cancelled"}, ctx.Err()
+		case <-ticker.C:
+			if isPaneDead(sessionName) {
+				return c.handleDeadPane(sessionName, logFile)
+			}
+
+			if !exitSent && isSessionComplete(session.CWD, session.SessionID) {
+				c.logger.Debug("claude completed (JSONL idle), sending exit", "session", sessionName)
+				exitCmd := exec.Command("tmux", "send-keys", "-t", sessionName, "C-d")
+				if err := exitCmd.Run(); err != nil {
+					c.logger.Warn("failed to send exit to tmux", "err", err)
+				}
+				exitSent = true
+			}
+		}
+	}
+}
+
+// isPaneDead checks if the tmux pane process has exited
+func isPaneDead(sessionName string) bool {
+	cmd := exec.Command("tmux", "display-message", "-t", sessionName, "-p", "#{pane_dead}")
+	out, err := cmd.Output()
+	if err != nil {
+		return true // session gone entirely
+	}
+	return strings.TrimSpace(string(out)) == "1"
+}
+
+// handleDeadPane reads exit code from dead pane, cleans up, and returns result
+func (c *Client) handleDeadPane(sessionName, logFile string) (*Result, error) {
+	exitCodeCmd := exec.Command("tmux", "display-message", "-t", sessionName, "-p", "#{pane_dead_status}")
+	exitOut, err := exitCodeCmd.Output()
+	var exitCode int
+	if err == nil {
+		_, _ = fmt.Sscanf(strings.TrimSpace(string(exitOut)), "%d", &exitCode)
+	}
+	_ = exec.Command("tmux", "kill-session", "-t", sessionName).Run()
+	return c.readFinalResult(logFile, exitCode)
+}
+
+// getSessionFromPID reads Claude's session file for a given process ID
+func getSessionFromPID(pid int) (*claudeSessionFile, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, fmt.Errorf("get home dir: %w", err)
+	}
+	path := filepath.Join(home, ".claude", "sessions", fmt.Sprintf("%d.json", pid))
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read session file: %w", err)
+	}
+	var s claudeSessionFile
+	if err := json.Unmarshal(data, &s); err != nil {
+		return nil, fmt.Errorf("parse session file: %w", err)
+	}
+	return &s, nil
+}
+
+// isSessionComplete checks if Claude finished responding by reading JSONL state
+func isSessionComplete(cwd, sessionID string) bool {
+	ss := readSessionState(cwd, sessionID)
+	switch {
+	case ss.msgType == "" || ss.msgType == "system":
+		return false // not started yet
+	case !ss.stale:
+		return false // still actively writing
+	case ss.msgType == "assistant" && ss.hasToolUse:
+		return false // tool executing (shouldn't happen with --dangerously-skip-permissions)
+	default:
+		return true // stale non-tool message = Claude idle at prompt
+	}
+}
+
+// readSessionState reads the last JSONL entry for a Claude session
+func readSessionState(cwd, sessionID string) sessionState {
+	if cwd == "" || sessionID == "" {
+		return sessionState{}
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return sessionState{}
+	}
+	projectKey := nonAlphanumDash.ReplaceAllString(cwd, "-")
+	path := filepath.Join(home, ".claude", "projects", projectKey, sessionID+".jsonl")
+	return readLastJSONL(path)
+}
+
+// readLastJSONL reads the last line of a JSONL file and parses session state
+func readLastJSONL(path string) sessionState {
+	f, err := os.Open(path)
+	if err != nil {
+		return sessionState{}
+	}
+	defer func() { _ = f.Close() }()
+
+	info, err := f.Stat()
+	if err != nil {
+		return sessionState{}
+	}
+
+	stale := time.Since(info.ModTime()) > staleThreshold
+
+	// Seek to last 8KB for efficiency
+	offset := max(info.Size()-8192, 0)
+	if _, err := f.Seek(offset, 0); err != nil {
+		return sessionState{}
+	}
+
+	var lastLine string
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 256*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.TrimSpace(line) != "" {
+			lastLine = line
+		}
+	}
+
+	if lastLine == "" {
+		return sessionState{}
+	}
+
+	var msg struct {
+		Type    string `json:"type"`
+		Message struct {
+			Content []struct {
+				Type string `json:"type"`
+			} `json:"content"`
+		} `json:"message"`
+	}
+	if err := json.Unmarshal([]byte(lastLine), &msg); err != nil {
+		return sessionState{}
+	}
+
+	hasToolUse := false
+	for _, c := range msg.Message.Content {
+		if c.Type == "tool_use" {
+			hasToolUse = true
+			break
+		}
+	}
+
+	return sessionState{
+		msgType:    msg.Type,
+		hasToolUse: hasToolUse,
+		stale:      stale,
+	}
+}
+
+// readFinalResult reads log file and determines success based on exit code
+func (c *Client) readFinalResult(logFile string, exitCode int) (*Result, error) {
+	out, readErr := os.ReadFile(logFile)
+	if readErr != nil {
+		return &Result{
+			Success:    false,
+			Output:     "",
+			OutputFile: logFile,
+		}, fmt.Errorf("read log file: %w", readErr)
+	}
+
+	// Success if exit code is 0
+	success := exitCode == 0
+
+	return &Result{
+		Success:    success,
+		Output:     string(out),
+		OutputFile: logFile,
+	}, nil
+}
+
 // RunWithCallback spawns Claude with live output streaming via callback
 func (c *Client) RunWithCallback(ctx context.Context, workdir, prompt string, callback OutputCallback) (*Result, error) {
+	// Use tmux mode if enabled
+	if c.useTmux {
+		sessionName := c.generateTmuxSessionName(workdir)
+		c.logger.Info("using tmux mode", "session", sessionName)
+		return c.RunInTmux(ctx, sessionName, workdir, prompt, callback)
+	}
+
 	var args []string
 	if callback != nil {
 		// Use stream-json for real-time streaming
@@ -133,7 +607,7 @@ func (c *Client) RunWithCallback(ctx context.Context, workdir, prompt string, ca
 	go func() {
 		scanner := bufio.NewScanner(stdout)
 		scanner.Buffer(make([]byte, 64*1024), 1024*1024) // 1MB max token
-		var lineBuf strings.Builder // Buffer for partial deltas
+		var lineBuf strings.Builder                      // Buffer for partial deltas
 		for scanner.Scan() {
 			line := scanner.Text()
 			outputMu.Lock()
@@ -305,6 +779,14 @@ func (c *Client) RunCommand(ctx context.Context, workdir, outputDir, command str
 
 // RunCommandWithCallback spawns Claude command with live output streaming
 func (c *Client) RunCommandWithCallback(ctx context.Context, workdir, outputDir, command string, callback OutputCallback, args ...string) (*Result, error) {
+	// Use tmux mode if enabled
+	if c.useTmux {
+		sessionName := c.generateTmuxSessionName(workdir)
+		c.logger.Info("using tmux mode for command", "session", sessionName, "command", command)
+		prompt := fmt.Sprintf("/%s %s", command, strings.Join(args, " "))
+		return c.RunInTmux(ctx, sessionName, workdir, prompt, callback)
+	}
+
 	var cliArgs []string
 	if callback != nil {
 		// Use stream-json for real-time streaming
@@ -363,7 +845,7 @@ func (c *Client) RunCommandWithCallback(ctx context.Context, workdir, outputDir,
 		go func() {
 			scanner := bufio.NewScanner(stdout)
 			scanner.Buffer(make([]byte, 64*1024), 1024*1024) // 1MB max token
-			var lineBuf strings.Builder // Buffer for partial deltas
+			var lineBuf strings.Builder                      // Buffer for partial deltas
 			for scanner.Scan() {
 				line := scanner.Text()
 				outputMu.Lock()
