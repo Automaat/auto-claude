@@ -155,25 +155,28 @@ tail -f /tmp/auto-claude/worktrees/myorg-myrepo/pr-123/.auto-claude-logs/tmux-au
 
 ### Completion Detection
 
-**Stop hook integration:**
+**JSONL state polling (via ~/.claude files):**
 
-- Global hook: `~/.claude/hooks/mark-session-end.sh` - writes marker when Claude finishes
-- Global config: `~/.claude/settings.json` - registers Stop hook
-- Marker location: `~/.auto-claude/markers/{session-name}.marker`
-- Daemon polls marker file (1s interval)
-- When marker detected, daemon sends Ctrl-D to exit Claude
+- Claude writes session metadata to `~/.claude/sessions/{PID}.json`
+- Conversation state tracked in `~/.claude/projects/{projectKey}/{sessionID}.jsonl`
+- Daemon gets pane PID from tmux, reads session file for sessionId
+- Polls JSONL last line every 500ms to detect idle state
+- Completion = last message is stale (>5s) and not an active tool_use
+- On completion: sends Ctrl-D to exit Claude gracefully
 - Exit status captured from tmux pane using `remain-on-exit` option
 
 **Flow:**
 
 ```
-Claude processes prompt
+Start Claude in tmux (interactive, no -p)
   ↓
-Stop hook fires (Claude finished response)
+Send prompt via tmux send-keys
   ↓
-Hook writes .auto-claude-session-end marker
+Get pane PID → read ~/.claude/sessions/{PID}.json
   ↓
-Daemon detects marker
+Poll ~/.claude/projects/{key}/{sessionId}.jsonl
+  ↓
+Last JSONL entry stale + no active tool_use = done
   ↓
 Daemon sends Ctrl-D to exit Claude
   ↓
@@ -182,12 +185,13 @@ Daemon captures exit code from pane
 Session cleaned up
 ```
 
-**Advantages over idle detection:**
+**Advantages:**
 
-- Deterministic - fires exactly when Claude finishes
-- No false positives from slow operations
-- No arbitrary timeout thresholds
-- Integrates with Claude's native hook system
+- No global hooks or marker files needed
+- Uses Claude's native state tracking
+- Works in interactive mode - maintains full TUI
+- No external state directory (~/.auto-claude/markers/)
+- Handles crashes via pane death detection
 
 ### Benefits
 
@@ -197,7 +201,7 @@ Session cleaned up
 - **Debugging:** Attach when worker stuck to see what Claude is waiting for
 - **Persistent logs:** Full output captured via periodic tmux capture-pane snapshots for later review
 - **Session persistence:** Can attach/detach without interrupting Claude's work
-- **Reliable completion:** Stop hook guarantees detection when Claude finishes
+- **Self-contained:** No global hooks or external state required
 
 ### Cleanup
 

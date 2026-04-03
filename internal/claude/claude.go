@@ -9,10 +9,29 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
 )
+
+// Session discovery types for reading ~/.claude state files
+type claudeSessionFile struct {
+	PID       int    `json:"pid"`
+	SessionID string `json:"sessionId"`
+	CWD       string `json:"cwd"`
+	StartedAt int64  `json:"startedAt"`
+}
+
+type sessionState struct {
+	msgType    string
+	hasToolUse bool
+	stale      bool
+}
+
+var nonAlphanumDash = regexp.MustCompile(`[^a-zA-Z0-9-]`)
+
+const staleThreshold = 5 * time.Second
 
 type Client struct {
 	model             string
@@ -168,15 +187,13 @@ func (c *Client) RunInTmux(ctx context.Context, sessionName, workdir, prompt str
 
 	// Build tmux command with proper terminal settings for Claude TUI
 	// Start Claude in interactive mode WITHOUT -p flag to get full TUI
-	// Pass session name via env var so Stop hook can create marker with correct name
 	tmuxArgs := []string{
 		"new-session", "-d",
 		"-s", sessionName,
 		"-c", workdir,
 		"-x", "200", // width
-		"-y", "50",  // height
+		"-y", "50", // height
 		"-e", "TERM=screen-256color",
-		"-e", "AUTO_CLAUDE_SESSION=" + sessionName,
 		"claude", "--model", c.model, "--dangerously-skip-permissions",
 	}
 
@@ -237,8 +254,8 @@ func (c *Client) RunInTmux(ctx context.Context, sessionName, workdir, prompt str
 	// Save output to log file periodically
 	go c.savePeriodicSnapshot(ctx, sessionName, logFile)
 
-	// Wait for session to complete (monitors marker file from Stop hook)
-	return c.waitForTmuxSession(ctx, sessionName, workdir, logFile)
+	// Wait for session to complete (monitors ~/.claude JSONL state)
+	return c.waitForSessionComplete(ctx, sessionName, workdir, logFile)
 }
 
 // captureFromTmux captures output from tmux pane scrollback and streams to callback
@@ -297,70 +314,199 @@ func (c *Client) savePeriodicSnapshot(ctx context.Context, sessionName, logFile 
 	}
 }
 
-// waitForTmuxSession polls for Stop hook marker file, then exits Claude and captures status
-func (c *Client) waitForTmuxSession(ctx context.Context, sessionName, workdir, logFile string) (*Result, error) {
-	ticker := time.NewTicker(1 * time.Second)
+// waitForSessionComplete monitors ~/.claude JSONL state to detect completion
+func (c *Client) waitForSessionComplete(ctx context.Context, sessionName, workdir, logFile string) (*Result, error) {
+	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
-	// Marker written to ~/.auto-claude/markers/{session-name}.marker by Stop hook
-	homeDir, err := os.UserHomeDir()
+	// Get pane PID to find Claude's session file
+	pidCmd := exec.CommandContext(ctx, "tmux", "display-message", "-t", sessionName, "-p", "#{pane_pid}")
+	pidOut, err := pidCmd.Output()
 	if err != nil {
-		homeDir = os.Getenv("HOME")
+		_ = exec.Command("tmux", "kill-session", "-t", sessionName).Run()
+		return &Result{Success: false}, fmt.Errorf("get pane pid: %w", err)
 	}
-	markerPath := filepath.Join(homeDir, ".auto-claude", "markers", sessionName+".marker")
-	var exitSent bool
+	var panePID int
+	fmt.Sscanf(strings.TrimSpace(string(pidOut)), "%d", &panePID)
+	c.logger.Debug("tmux pane pid", "pid", panePID)
 
+	// Phase A: wait for Claude session file to appear (up to 30s)
+	var session *claudeSessionFile
+	deadline := time.Now().Add(30 * time.Second)
+	for session == nil {
+		select {
+		case <-ctx.Done():
+			_ = exec.Command("tmux", "kill-session", "-t", sessionName).Run()
+			return &Result{Success: false, Output: "cancelled"}, ctx.Err()
+		case <-ticker.C:
+			if time.Now().After(deadline) {
+				_ = exec.Command("tmux", "kill-session", "-t", sessionName).Run()
+				return &Result{Success: false}, fmt.Errorf("timeout waiting for session file (pid %d)", panePID)
+			}
+			if isPaneDead(sessionName) {
+				return c.handleDeadPane(sessionName, logFile)
+			}
+			s, err := getSessionFromPID(panePID)
+			if err == nil {
+				session = s
+			}
+		}
+	}
+
+	c.logger.Debug("found claude session", "pid", panePID, "sessionId", session.SessionID, "cwd", session.CWD)
+
+	// Phase B: poll JSONL for completion
+	var exitSent bool
 	for {
 		select {
 		case <-ctx.Done():
-			// Kill session on context cancellation
 			_ = exec.Command("tmux", "kill-session", "-t", sessionName).Run()
-			_ = os.Remove(markerPath)
 			return &Result{Success: false, Output: "cancelled"}, ctx.Err()
 		case <-ticker.C:
-			// Check for completion marker from Stop hook
-			if !exitSent {
-				if _, err := os.Stat(markerPath); err == nil {
-					// Marker exists - Claude finished processing
-					c.logger.Debug("claude completed (stop hook fired), sending exit", "session", sessionName, "marker", markerPath)
-
-					// Send Ctrl-D to exit Claude gracefully
-					exitCmd := exec.CommandContext(ctx, "tmux", "send-keys", "-t", sessionName, "C-d")
-					if err := exitCmd.Run(); err != nil {
-						c.logger.Warn("failed to send exit to tmux", "err", err)
-					}
-
-					exitSent = true
-					_ = os.Remove(markerPath) // Clean up marker
-				}
-				continue
+			if isPaneDead(sessionName) {
+				return c.handleDeadPane(sessionName, logFile)
 			}
 
-			// After exit sent, wait for pane to die
-			statusCmd := exec.Command("tmux", "display-message", "-t", sessionName, "-p", "#{pane_dead}")
-			statusOut, err := statusCmd.Output()
-			if err != nil {
-				// Session might be completely gone - expected after exit
-				return c.readFinalResult(logFile, 0)
-			}
-
-			isDead := strings.TrimSpace(string(statusOut)) == "1"
-			if isDead {
-				// Pane is dead, get exit status
-				exitCodeCmd := exec.Command("tmux", "display-message", "-t", sessionName, "-p", "#{pane_dead_status}")
-				exitOut, err := exitCodeCmd.Output()
-
-				var exitCode int
-				if err == nil {
-					fmt.Sscanf(string(exitOut), "%d", &exitCode)
+			if !exitSent && isSessionComplete(session.CWD, session.SessionID) {
+				c.logger.Debug("claude completed (JSONL idle), sending exit", "session", sessionName)
+				exitCmd := exec.Command("tmux", "send-keys", "-t", sessionName, "C-d")
+				if err := exitCmd.Run(); err != nil {
+					c.logger.Warn("failed to send exit to tmux", "err", err)
 				}
-
-				// Clean up session
-				_ = exec.Command("tmux", "kill-session", "-t", sessionName).Run()
-
-				return c.readFinalResult(logFile, exitCode)
+				exitSent = true
 			}
 		}
+	}
+}
+
+// isPaneDead checks if the tmux pane process has exited
+func isPaneDead(sessionName string) bool {
+	cmd := exec.Command("tmux", "display-message", "-t", sessionName, "-p", "#{pane_dead}")
+	out, err := cmd.Output()
+	if err != nil {
+		return true // session gone entirely
+	}
+	return strings.TrimSpace(string(out)) == "1"
+}
+
+// handleDeadPane reads exit code from dead pane, cleans up, and returns result
+func (c *Client) handleDeadPane(sessionName, logFile string) (*Result, error) {
+	exitCodeCmd := exec.Command("tmux", "display-message", "-t", sessionName, "-p", "#{pane_dead_status}")
+	exitOut, err := exitCodeCmd.Output()
+	var exitCode int
+	if err == nil {
+		fmt.Sscanf(strings.TrimSpace(string(exitOut)), "%d", &exitCode)
+	}
+	_ = exec.Command("tmux", "kill-session", "-t", sessionName).Run()
+	return c.readFinalResult(logFile, exitCode)
+}
+
+// getSessionFromPID reads Claude's session file for a given process ID
+func getSessionFromPID(pid int) (*claudeSessionFile, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, fmt.Errorf("get home dir: %w", err)
+	}
+	path := filepath.Join(home, ".claude", "sessions", fmt.Sprintf("%d.json", pid))
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read session file: %w", err)
+	}
+	var s claudeSessionFile
+	if err := json.Unmarshal(data, &s); err != nil {
+		return nil, fmt.Errorf("parse session file: %w", err)
+	}
+	return &s, nil
+}
+
+// isSessionComplete checks if Claude finished responding by reading JSONL state
+func isSessionComplete(cwd, sessionID string) bool {
+	ss := readSessionState(cwd, sessionID)
+	switch {
+	case ss.msgType == "" || ss.msgType == "system":
+		return false // not started yet
+	case !ss.stale:
+		return false // still actively writing
+	case ss.msgType == "assistant" && ss.hasToolUse:
+		return false // tool executing (shouldn't happen with --dangerously-skip-permissions)
+	default:
+		return true // stale non-tool message = Claude idle at prompt
+	}
+}
+
+// readSessionState reads the last JSONL entry for a Claude session
+func readSessionState(cwd, sessionID string) sessionState {
+	if cwd == "" || sessionID == "" {
+		return sessionState{}
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return sessionState{}
+	}
+	projectKey := nonAlphanumDash.ReplaceAllString(cwd, "-")
+	path := filepath.Join(home, ".claude", "projects", projectKey, sessionID+".jsonl")
+	return readLastJSONL(path)
+}
+
+// readLastJSONL reads the last line of a JSONL file and parses session state
+func readLastJSONL(path string) sessionState {
+	f, err := os.Open(path)
+	if err != nil {
+		return sessionState{}
+	}
+	defer func() { _ = f.Close() }()
+
+	info, err := f.Stat()
+	if err != nil {
+		return sessionState{}
+	}
+
+	stale := time.Since(info.ModTime()) > staleThreshold
+
+	// Seek to last 8KB for efficiency
+	offset := max(info.Size()-8192, 0)
+	if _, err := f.Seek(offset, 0); err != nil {
+		return sessionState{}
+	}
+
+	var lastLine string
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 256*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.TrimSpace(line) != "" {
+			lastLine = line
+		}
+	}
+
+	if lastLine == "" {
+		return sessionState{}
+	}
+
+	var msg struct {
+		Type    string `json:"type"`
+		Message struct {
+			Content []struct {
+				Type string `json:"type"`
+			} `json:"content"`
+		} `json:"message"`
+	}
+	if err := json.Unmarshal([]byte(lastLine), &msg); err != nil {
+		return sessionState{}
+	}
+
+	hasToolUse := false
+	for _, c := range msg.Message.Content {
+		if c.Type == "tool_use" {
+			hasToolUse = true
+			break
+		}
+	}
+
+	return sessionState{
+		msgType:    msg.Type,
+		hasToolUse: hasToolUse,
+		stale:      stale,
 	}
 }
 
